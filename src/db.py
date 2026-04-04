@@ -1,0 +1,52 @@
+"""
+db.py — SQLite schema initialisation via aiosqlite.
+Run directly:  python -m src.db
+"""
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import aiosqlite
+from loguru import logger
+
+DB_PATH = Path(__file__).parent.parent / "accounts.db"
+
+_DDL = [
+    """
+    CREATE TABLE IF NOT EXISTS accounts (
+        email       TEXT PRIMARY KEY,
+        password    TEXT NOT NULL DEFAULT '',
+        status      TEXT NOT NULL DEFAULT 'created',
+        first_name  TEXT NOT NULL DEFAULT '',
+        last_name   TEXT NOT NULL DEFAULT '',
+        provider    TEXT NOT NULL DEFAULT '',
+        proxy       TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT '',
+        raw_json    TEXT NOT NULL DEFAULT '{}'
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS proxies (
+        address    TEXT PRIMARY KEY,
+        fail_count INTEGER NOT NULL DEFAULT 0,
+        last_used  REAL    NOT NULL DEFAULT 0,
+        is_active  INTEGER NOT NULL DEFAULT 1
+    )
+    """,
+]
+
+
+async def init() -> None:
+    """Create tables if they do not exist."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        for ddl in _DDL:
+            await db.execute(ddl)
+        await db.commit()
+    logger.info(f"DB initialized at {DB_PATH}")
+
+
+if __name__ == "__main__":
+    asyncio.run(init())
+    print(f"DB initialized at {DB_PATH}")
+

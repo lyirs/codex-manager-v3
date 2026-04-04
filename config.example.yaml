@@ -1,0 +1,73 @@
+# =============================================================================
+# config.example.yaml — 配置模板
+# 使用方法: 复制本文件为 config.yaml，按需填写后运行程序
+#   cp config.example.yaml config.yaml
+# =============================================================================
+
+# ── 浏览器引擎 ─────────────────────────────────────────────────────────────
+# playwright : Chromium，速度快，注入 stealth JS 反检测
+# camoufox   : 基于 Firefox 的指纹混淆引擎，反检测更强（推荐生产环境）
+engine: playwright
+
+# 最大同时运行的浏览器实例数量（建议不超过 CPU 核心数）
+max_concurrent: 2
+
+# ── 邮件服务 ───────────────────────────────────────────────────────────────
+# 选择一个临时邮件服务来接收 ChatGPT 验证码
+# 可选值: gptmail | npcmail | yydsmail
+mail_provider: gptmail
+
+mail:
+  # GPTMail — https://mail.chatgpt.org.uk
+  # 公共 key "gpt-test" 可免费使用，但有严格频率限制
+  # 大批量注册请申请付费 key
+  gptmail:
+    api_key: "gpt-test"
+    base_url: "https://mail.chatgpt.org.uk"
+
+  # NPCmail — https://dash.xphdfs.me
+  # 需要注册账号后在控制台获取 API Key
+  npcmail:
+    api_key: ""
+    base_url: "https://dash.xphdfs.me"
+
+  # YYDS Mail — https://maliapi.215.im
+  # 需要注册账号后在控制台获取 API Key
+  yydsmail:
+    api_key: ""
+    base_url: "https://maliapi.215.im/v1"
+
+# ── 邮箱生成规则 ───────────────────────────────────────────────────────────
+registration:
+  # 邮箱用户名前缀，留空则由程序随机生成 12 位字符串
+  prefix: ""
+  # 邮箱域名，留空则由邮件服务自动分配
+  # 填写示例: "example.com"（需要邮件服务支持自定义域名）
+  domain: ""
+
+# ── 代理设置 ───────────────────────────────────────────────────────────────
+# proxy_strategy 决定代理来源，优先级：
+#   --proxy CLI 参数  >  static（配置文件固定代理）  >  pool（数据库轮询）  >  none
+#
+# 可选值:
+#   none   — 不使用代理，直连
+#   static — 使用下方 proxy_static 指定的固定代理
+#   pool   — 从数据库代理池中轮询分配（使用 import-proxies 命令导入代理）
+proxy_strategy: none
+
+# 固定代理 URL（proxy_strategy=static 时生效）
+# 支持格式:
+#   http://host:port
+#   http://user:pass@host:port
+#   socks5://user:pass@host:port
+proxy_static: ""
+
+# ── 团队账号同步（预留，暂未实现）────────────────────────────────────────
+team:
+  url: ""   # 团队 API 地址
+  key: ""   # 团队 API Key
+
+sync:
+  url: ""   # 同步服务地址
+  key: ""   # 同步服务 Key
+
