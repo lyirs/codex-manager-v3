@@ -575,13 +575,34 @@ async def _state_machine(
     logger.info(f"[{task_id}] OTP page loaded — polling gptmail inbox")
 
     # tool.js: _0xa9e — poll gptmail every 3 s up to 60 iterations
-    await jitter_sleep(2.0, 0.5)  # _0x1ae(0x7d0)
-    code = await mail_client.poll_code(
-        account["email"],
-        timeout=int(timeouts.get("otp_code", CODE_TIMEOUT)),
-    )
+    # If no code arrives within timeout, click the "Resend" button and retry
+    # (up to _RESEND_MAX extra attempts).
+    _RESEND_MAX = 2
+    code = None
+    for _resend_attempt in range(_RESEND_MAX + 1):
+        await jitter_sleep(2.0, 0.5)  # _0x1ae(0x7d0)
+        code = await mail_client.poll_code(
+            account["email"],
+            timeout=int(timeouts.get("otp_code", CODE_TIMEOUT)),
+        )
+        if code:
+            break
+
+        if _resend_attempt < _RESEND_MAX:
+            logger.warning(
+                f"[{task_id}] 验证码未收到（第 {_resend_attempt + 1}/{_RESEND_MAX} 次重发）"
+            )
+            if log_fn:
+                log_fn(f"⚠️ 验证码超时，尝试重新发送（{_resend_attempt + 1}/{_RESEND_MAX}）…")
+            resent = await _click_resend_button(task_id, page)
+            if not resent:
+                logger.warning(f"[{task_id}] 未找到重发按钮，放弃重试")
+                break
+            # Brief wait for the new email to be sent before polling again
+            await asyncio.sleep(3.0)
+
     if not code:
-        raise RegistrationError("OTP code not received within timeout")
+        raise RegistrationError("OTP code not received within timeout (including resend retries)")
 
     logger.info(f"[{task_id}] FILL_CODE → {code}")
     _step(6, f"填写验证码 {code}")
@@ -771,6 +792,53 @@ async def _wait_for_otp_inputs(page: Page, timeout_ms: int = 60_000) -> bool:
             if await is_visible(page, sel):
                 return True
         await asyncio.sleep(1.0)
+    return False
+
+
+async def _click_resend_button(task_id: str, page: Page) -> bool:
+    """
+    Look for a "Resend" / "Resend email" button on the Auth0 OTP page and click it.
+
+    Returns True if a button was found and clicked, False otherwise.
+    Tries Playwright text-based locators first (most reliable for Auth0), then
+    falls back to common CSS selectors.
+    """
+    _text_variants = [
+        "Resend email", "Resend", "Send again",
+        "重新发送", "Didn't receive",
+    ]
+    # 1. Try Playwright get_by_role / get_by_text (most reliable)
+    for text in _text_variants:
+        for loc in [
+            page.get_by_role("button", name=text, exact=False),
+            page.get_by_role("link",   name=text, exact=False),
+            page.get_by_text(text, exact=False),
+        ]:
+            try:
+                if await loc.first.is_visible(timeout=800):
+                    await loc.first.click()
+                    logger.info(f"[{task_id}] 重发按钮已点击（文本: {text!r}）")
+                    return True
+            except Exception:
+                pass
+
+    # 2. CSS selector fallbacks
+    _CSS_SELECTORS = [
+        "[data-action-button-secondary]",
+        "button[class*='resend']",
+        "a[class*='resend']",
+    ]
+    for sel in _CSS_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=500):
+                await loc.click()
+                logger.info(f"[{task_id}] 重发按钮已点击（CSS: {sel!r}）")
+                return True
+        except Exception:
+            pass
+
+    logger.debug(f"[{task_id}] 未找到重发按钮（URL={page.url}）")
     return False
 
 

@@ -538,73 +538,100 @@ async def _camoufox_page(proxy_cfg, viewport, headless: bool, slow_mo: int, mobi
             "Run:  uv run python -m camoufox fetch"
         ) from exc
 
-    extra_kwargs: dict = {}
-
-    if mobile:
-        # Choose a random mobile viewport; use Linux (closest to Android in terms of
-        # BrowserForge OS pool) and constrain screen to mobile dimensions.
-        mv = random.choice(_MOBILE_VIEWPORTS)
-        win_size = (mv["width"], mv["height"])
-        os_choice = "linux"
-        try:
-            from browserforge.fingerprints import Screen as _BFScreen  # type: ignore
-            extra_kwargs["screen"] = _BFScreen(
-                max_width=mv["width"] + 30,
-                max_height=mv["height"] + 30,
-            )
-        except Exception:
-            pass  # BrowserForge Screen not available — window size alone is enough
-    else:
-        # Randomize OS — Windows is most common, include macOS for variety
-        os_choice = random.choice(["windows", "windows", "windows", "macos"])
-        win_size = (viewport["width"], viewport["height"])
-
     # geoip=True: camoufox resolves real timezone/locale from proxy's exit IP
     # humanize=True: built-in human-like timing for mouse events (helps vs bot-detect)
     # block_webrtc=True: prevent WebRTC from leaking local IP through proxy
     # window expects (width, height) tuple, NOT a dict
     #
-    # BrowserForge OS fallback: some OS/window-size combinations have too few
-    # fingerprints in the dataset and raise
-    #   "No headers based on this input can be generated."
-    # We retry with alternative OS values before giving up.
-    _os_fallback = [os_choice] + [o for o in ("linux", "macos", "windows") if o != os_choice]
+    # BrowserForge coverage issue: some OS/window-size combinations have too few
+    # fingerprints in the dataset and raise "No headers based on this input can be
+    # generated."  This often manifests as a first-run failure because the randomly
+    # chosen viewport happens to fall in a sparse part of the DB.
+    # Strategy: outer retry loop (up to _MAX_INIT_ATTEMPTS) that re-randomises the
+    # viewport and OS on each attempt; inner OS-fallback loop tries all three OSes
+    # with the same viewport before moving on.
+    _BF_REJECT_KEYWORDS = (
+        "no headers", "requirements you specified", "relax",
+        "could not generate", "generate http", "browserforge",
+        "no fingerprint", "no browser fingerprint",
+    )
+    _MAX_INIT_ATTEMPTS = 3
 
     cam_cm = None
     browser = None
-    for _os_try in _os_fallback:
-        try:
-            cam_cm = AsyncCamoufox(
-                headless=headless,
-                proxy=proxy_cfg,
-                os=_os_try,
-                locale="en-US",
-                block_webrtc=True,
-                humanize=True,
-                window=win_size,          # (width, height) tuple
-                geoip=proxy_cfg is not None,
-                **extra_kwargs,
-            )
-            browser = await cam_cm.__aenter__()
-            if _os_try != os_choice:
-                logger.info(f"[engine] Camoufox: fell back to OS={_os_try!r} (BrowserForge rejected {os_choice!r})")
-            break
-        except Exception as _bf_exc:
-            _msg = str(_bf_exc).lower()
-            if "no headers" in _msg or "requirements you specified" in _msg or "relax" in _msg:
-                logger.warning(
-                    f"[engine] Camoufox OS={_os_try!r} BrowserForge rejection — "
-                    f"trying next OS… ({_bf_exc})"
+
+    for _init_attempt in range(_MAX_INIT_ATTEMPTS):
+        extra_kwargs: dict = {}
+
+        if mobile:
+            mv = random.choice(_MOBILE_VIEWPORTS)
+            win_size = (mv["width"], mv["height"])
+            os_choice = "linux"
+            try:
+                from browserforge.fingerprints import Screen as _BFScreen  # type: ignore
+                extra_kwargs["screen"] = _BFScreen(
+                    max_width=mv["width"] + 30,
+                    max_height=mv["height"] + 30,
                 )
-                cam_cm = None
-                continue
-            raise
+            except Exception:
+                pass  # BrowserForge Screen not available — window size alone is enough
+        else:
+            # Randomize OS — Windows is most common, include macOS for variety.
+            # On retries pick a fresh random viewport to escape DB coverage gaps.
+            os_choice = random.choice(["windows", "windows", "windows", "macos"])
+            cur_viewport = viewport if _init_attempt == 0 else random.choice(_VIEWPORTS)
+            win_size = (cur_viewport["width"], cur_viewport["height"])
+
+        _os_fallback = [os_choice] + [o for o in ("linux", "macos", "windows") if o != os_choice]
+
+        for _os_try in _os_fallback:
+            try:
+                cam_cm = AsyncCamoufox(
+                    headless=headless,
+                    proxy=proxy_cfg,
+                    os=_os_try,
+                    locale="en-US",
+                    block_webrtc=True,
+                    humanize=True,
+                    window=win_size,          # (width, height) tuple
+                    geoip=proxy_cfg is not None,
+                    **extra_kwargs,
+                )
+                browser = await cam_cm.__aenter__()
+                if _os_try != os_choice:
+                    logger.info(
+                        f"[engine] Camoufox: fell back to OS={_os_try!r} "
+                        f"(BrowserForge rejected {os_choice!r})"
+                    )
+                break
+            except Exception as _bf_exc:
+                _msg = str(_bf_exc).lower()
+                if any(kw in _msg for kw in _BF_REJECT_KEYWORDS):
+                    logger.warning(
+                        f"[engine] Camoufox OS={_os_try!r} BrowserForge rejection — "
+                        f"trying next OS… ({_bf_exc})"
+                    )
+                    cam_cm = None
+                    continue
+                raise
+
+        if browser is not None:
+            break  # successfully launched
+
+        # All OS options exhausted for this attempt — retry with fresh random values
+        if _init_attempt < _MAX_INIT_ATTEMPTS - 1:
+            logger.warning(
+                f"[engine] Camoufox: BrowserForge rejected all OS options "
+                f"(attempt {_init_attempt + 1}/{_MAX_INIT_ATTEMPTS}, "
+                f"viewport={win_size}) — retrying with fresh fingerprint…"
+            )
+            await asyncio.sleep(0.5)
 
     if browser is None or cam_cm is None:
         raise RuntimeError(
-            "Camoufox: BrowserForge could not generate HTTP headers for any OS "
-            f"(tried: {_os_fallback}). Try updating camoufox/browserforge: "
-            "`uv run python -m camoufox fetch`"
+            "Camoufox: BrowserForge could not generate HTTP headers after "
+            f"{_MAX_INIT_ATTEMPTS} attempts. "
+            "Try updating camoufox/browserforge: `uv run python -m camoufox fetch`"
         )
 
     page = None

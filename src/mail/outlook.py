@@ -25,15 +25,12 @@ Obtaining a refresh_token (one-time, per account):
 from __future__ import annotations
 
 import asyncio
-import base64
 import email as email_lib
-import random
 import re
 import time
 from email.header import decode_header, make_header
 from typing import Optional
 
-import aioimaplib
 import httpx
 from loguru import logger
 
@@ -45,8 +42,10 @@ _CODE_RE          = re.compile(r"\b(\d{6})\b")
 _CODE_FALLBACK_RE = re.compile(r"\b(\d{4,8})\b")
 
 _GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/messages"
-_IMAP_HOST          = "imap-mail.outlook.com"
+_GRAPH_JUNK_URL     = "https://graph.microsoft.com/v1.0/me/mailFolders/junkemail/messages"
+_IMAP_HOST          = "outlook.live.com"   # per plan/outlook.py reference
 _IMAP_PORT          = 993
+_IMAP_FOLDERS       = ["INBOX", "Junk"]    # also check Junk — OTP often lands there
 
 _SCOPE_GRAPH = "https://graph.microsoft.com/Mail.Read offline_access"
 _SCOPE_IMAP  = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
@@ -94,6 +93,8 @@ def _extract_text(msg: email_lib.message.Message) -> str:
 
 
 def _make_xoauth2_token(email: str, access_token: str) -> str:
+    """Build base64-encoded XOAUTH2 SASL string (kept for external use / tests)."""
+    import base64
     raw = f"user={email}\x01auth=Bearer {access_token}\x01\x01"
     return base64.b64encode(raw.encode()).decode()
 
@@ -106,6 +107,11 @@ class OutlookMailClient(MailClient):
 
     Token lifecycle is managed internally: the access_token is refreshed
     automatically before it expires using the stored refresh_token.
+
+    proxy : optional HTTP/SOCKS proxy URL, e.g. "http://127.0.0.1:10808"
+            When set, all httpx calls (token refresh + Graph API) will route
+            through this proxy.  Required in regions where Microsoft endpoints
+            are blocked (e.g. mainland China).
     """
 
     def __init__(
@@ -116,6 +122,7 @@ class OutlookMailClient(MailClient):
         refresh_token: str = "",
         access_token: str = "",
         fetch_method: str = "graph",   # "graph" | "imap"
+        proxy: Optional[str] = None,   # e.g. "http://127.0.0.1:10808"
     ) -> None:
         self._email         = email
         self._client_id     = client_id
@@ -123,7 +130,24 @@ class OutlookMailClient(MailClient):
         self._refresh_token = refresh_token
         self._access_token  = access_token
         self._fetch_method  = fetch_method
+        self._proxy         = proxy        # forwarded to every httpx client
         self._token_expiry  = 0.0   # Unix timestamp; 0 = always refresh
+
+    # ── httpx factory ─────────────────────────────────────────────────────
+
+    def _httpx_client(self, **extra) -> httpx.AsyncClient:
+        """
+        Return a configured httpx.AsyncClient.
+
+        httpx >= 0.27 accepts ``proxy`` (singular URL string).
+        If self._proxy is set the client routes all traffic through it.
+        trust_env=False prevents picking up Windows system proxy settings
+        (which can conflict with our explicit proxy).
+        """
+        kw: dict = {"timeout": 30, "trust_env": False, **extra}
+        if self._proxy:
+            kw["proxy"] = self._proxy
+        return httpx.AsyncClient(**kw)
 
     # ── Token management ──────────────────────────────────────────────────
 
@@ -143,8 +167,7 @@ class OutlookMailClient(MailClient):
             f"https://login.microsoftonline.com/{self._tenant_id}/oauth2/v2.0/token"
         )
 
-        # trust_env=False: 不读取 Windows 系统代理（避免代理拦截导致的 SSL 错误）
-        async with httpx.AsyncClient(timeout=30, trust_env=False) as c:
+        async with self._httpx_client() as c:
             r = await c.post(token_url, data={
                 "client_id":     self._client_id,
                 "grant_type":    "refresh_token",
@@ -186,36 +209,53 @@ class OutlookMailClient(MailClient):
         deadline  = time.monotonic() + timeout
         seen_ids: set[str] = set()
 
-        logger.info(f"[Outlook/Graph] Polling inbox for {self._email} (timeout={timeout}s)")
+        # Query both inbox and junk — OTP emails are often auto-filtered to Junk
+        _GRAPH_FOLDERS = [
+            (_GRAPH_MESSAGES_URL, "inbox"),
+            (_GRAPH_JUNK_URL,     "junk"),
+        ]
+        _PARAMS = {
+            "$select":  "id,subject,body,receivedDateTime",
+            "$filter":  "isRead eq false",
+            "$orderby": "receivedDateTime desc",
+            "$top":     "25",
+        }
+
+        logger.info(
+            f"[Outlook/Graph] Polling inbox+junk for {self._email} (timeout={timeout}s)"
+        )
 
         while time.monotonic() < deadline:
             try:
-                token = await self._get_token()
-                async with httpx.AsyncClient(timeout=30, trust_env=False) as c:
-                    r = await c.get(
-                        _GRAPH_MESSAGES_URL,
-                        headers={"Authorization": f"Bearer {token}"},
-                        params={
-                            "$select": "id,subject,body,receivedDateTime",
-                            "$filter": "isRead eq false",
-                            "$orderby": "receivedDateTime desc",
-                            "$top": "25",
-                        },
-                    )
-                    r.raise_for_status()
-                    messages = r.json().get("value", [])
+                token   = await self._get_token()
+                headers = {"Authorization": f"Bearer {token}"}
 
-                for msg in messages:
-                    mid = msg.get("id", "")
-                    if mid in seen_ids:
-                        continue
-                    seen_ids.add(mid)
-                    subject = msg.get("subject", "")
-                    body    = (msg.get("body") or {}).get("content", "")
-                    code = _extract_code(f"{subject} {body}")
-                    if code:
-                        logger.info(f"[Outlook/Graph] Code {code} for {self._email}")
-                        return code
+                async with self._httpx_client() as c:
+                    for url, folder_label in _GRAPH_FOLDERS:
+                        try:
+                            r = await c.get(url, headers=headers, params=_PARAMS)
+                            r.raise_for_status()
+                            messages = r.json().get("value", [])
+                        except Exception as exc:
+                            logger.warning(
+                                f"[Outlook/Graph] Error querying {folder_label}: {exc}"
+                            )
+                            continue
+
+                        for msg in messages:
+                            mid = msg.get("id", "")
+                            if mid in seen_ids:
+                                continue
+                            seen_ids.add(mid)
+                            subject = msg.get("subject", "")
+                            body    = (msg.get("body") or {}).get("content", "")
+                            code    = _extract_code(f"{subject} {body}")
+                            if code:
+                                logger.info(
+                                    f"[Outlook/Graph] Code {code} for {self._email}"
+                                    f" (folder={folder_label})"
+                                )
+                                return code
 
             except Exception as exc:
                 logger.warning(f"[Outlook/Graph] error: {exc}")
@@ -231,84 +271,294 @@ class OutlookMailClient(MailClient):
     # ── IMAP+XOAUTH2 fetch ────────────────────────────────────────────────
 
     async def _poll_imap(self, timeout: int) -> Optional[str]:
-        deadline      = time.monotonic() + timeout
+        """Route to proxy-aware IMAP implementation when a proxy is configured."""
+        if self._proxy:
+            return await self._poll_imap_via_proxy(timeout)
+        return await self._poll_imap_direct(timeout)
+
+    async def _poll_imap_via_proxy(self, timeout: int) -> Optional[str]:
+        """
+        Poll IMAP through an HTTP CONNECT proxy tunnel.
+
+        Follows plan/outlook.py pattern: each IMAP session runs entirely inside
+        asyncio.to_thread() so the event loop is never blocked.  Token is fetched
+        in the event loop first, then passed into the synchronous worker.
+
+        No extra dependencies — only stdlib socket, ssl, imaplib.
+        """
+        import base64 as _b64
+        import imaplib as _imaplib
+        import socket as _socket
+        import ssl as _ssl
+        from urllib.parse import urlparse
+
+        p          = urlparse(self._proxy)
+        proxy_host = p.hostname or "127.0.0.1"
+        proxy_port = p.port or 8080
+
+        deadline  = time.monotonic() + timeout
+        seen_uids: set[str] = set()
+
+        logger.info(
+            f"[Outlook/IMAP-proxy] Polling {self._email} "
+            f"via HTTP CONNECT {proxy_host}:{proxy_port} (timeout={timeout}s)"
+        )
+
+        def _sync_fetch(access_token: str) -> Optional[str]:
+            """
+            Synchronous: build CONNECT tunnel → SSL → IMAP4, authenticate,
+            search INBOX + Junk, return OTP code or None.
+            Runs inside asyncio.to_thread — must not call async code.
+            """
+            # ── 1. HTTP CONNECT tunnel ────────────────────────────────────
+            raw = _socket.create_connection((proxy_host, proxy_port), timeout=15)
+            raw.settimeout(30)
+
+            connect_req = (
+                f"CONNECT {_IMAP_HOST}:{_IMAP_PORT} HTTP/1.1\r\n"
+                f"Host: {_IMAP_HOST}:{_IMAP_PORT}\r\n"
+            )
+            if p.username and p.password:
+                cred = _b64.b64encode(
+                    f"{p.username}:{p.password}".encode()
+                ).decode()
+                connect_req += f"Proxy-Authorization: Basic {cred}\r\n"
+            connect_req += "\r\n"
+            raw.sendall(connect_req.encode())
+
+            resp_buf = b""
+            while b"\r\n\r\n" not in resp_buf:
+                chunk = raw.recv(4096)
+                if not chunk:
+                    raise ConnectionError("Proxy closed during CONNECT handshake")
+                resp_buf += chunk
+
+            status_line = resp_buf.split(b"\r\n")[0]
+            if b"200" not in status_line:
+                raise ConnectionError(
+                    f"HTTP CONNECT rejected: {status_line.decode(errors='replace')}"
+                )
+
+            # ── 2. SSL upgrade ────────────────────────────────────────────
+            ssl_ctx  = _ssl.create_default_context()
+            ssl_sock = ssl_ctx.wrap_socket(raw, server_hostname=_IMAP_HOST)
+            ssl_sock.settimeout(30)
+
+            # ── 3. Inject SSL socket into imaplib ─────────────────────────
+            # Subclass IMAP4 so open() hands back our ready SSL socket.
+            # IMAP4.__init__ calls open() then reads the server greeting.
+            _the_sock = ssl_sock
+
+            class _PatchedIMAP4(_imaplib.IMAP4):
+                def open(self, host, port=None):   # noqa: ARG002
+                    self.sock = _the_sock
+                    self.file = self.sock.makefile("rb")
+
+            M = _PatchedIMAP4(_IMAP_HOST)
+
+            try:
+                # ── 4. XOAUTH2 auth (plan/outlook.py pattern exactly) ─────
+                # imaplib.authenticate() base64-encodes what the callback
+                # returns, so we pass raw UTF-8 bytes here.
+                auth_bytes = (
+                    f"user={self._email}\x01auth=Bearer {access_token}\x01\x01"
+                ).encode("utf-8")
+                typ, resp = M.authenticate("XOAUTH2", lambda _: auth_bytes)
+                if typ != "OK":
+                    logger.warning(
+                        f"[Outlook/IMAP-proxy] Auth failed for {self._email}: {resp}"
+                    )
+                    return None
+
+                # ── 5. Search INBOX + Junk ────────────────────────────────
+                for folder_name in _IMAP_FOLDERS:
+                    try:
+                        typ, _ = M.select(f'"{folder_name}"', readonly=True)
+                        if typ != "OK":
+                            continue
+
+                        # Search ALL (not just UNSEEN) — OTP mails may be
+                        # auto-marked read by server rules.
+                        typ, data = M.search(None, "ALL")
+                        if typ != "OK" or not data or not data[0]:
+                            continue
+
+                        uid_list = data[0].decode().split()
+                        # Newest first (higher seq numbers = newer)
+                        for uid in reversed(uid_list):
+                            uid_key = f"{folder_name}/{uid}"
+                            if uid_key in seen_uids:
+                                continue
+                            seen_uids.add(uid_key)
+
+                            typ2, msg_data = M.fetch(uid, "(RFC822)")
+                            if typ2 != "OK" or not msg_data:
+                                continue
+
+                            raw_bytes: Optional[bytes] = None
+                            for part in msg_data:
+                                if isinstance(part, tuple) and len(part) >= 2:
+                                    raw_bytes = part[1]
+                                    break
+                            if not raw_bytes:
+                                continue
+
+                            msg     = email_lib.message_from_bytes(raw_bytes)
+                            subject = _decode_str(msg.get("Subject", ""))
+                            body    = _extract_text(msg)
+                            code    = _extract_code(f"{subject} {body}")
+                            if code:
+                                logger.info(
+                                    f"[Outlook/IMAP-proxy] Code {code} for {self._email}"
+                                    f" (folder={folder_name})"
+                                )
+                                return code
+
+                    except Exception as exc:
+                        logger.warning(
+                            f"[Outlook/IMAP-proxy] folder {folder_name}: {exc!r}"
+                        )
+
+            finally:
+                try:
+                    M.logout()
+                except Exception:
+                    pass
+
+            return None
+
+        # ── Async poll loop ────────────────────────────────────────────────
+        while time.monotonic() < deadline:
+            try:
+                # Token refresh is async — must happen in the event loop,
+                # not inside asyncio.to_thread.
+                token = await self._get_token()
+                code  = await asyncio.to_thread(_sync_fetch, token)
+                if code:
+                    return code
+
+            except asyncio.TimeoutError:
+                logger.warning("[Outlook/IMAP-proxy] Operation timed out — retrying")
+            except OSError as exc:
+                logger.warning(
+                    f"[Outlook/IMAP-proxy] Network error [{type(exc).__name__}]: {exc!r}"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[Outlook/IMAP-proxy] Error [{type(exc).__name__}]: {exc!r}"
+                )
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(4, remaining))
+
+        logger.warning(f"[Outlook/IMAP-proxy] Timed out ({self._email})")
+        return None
+
+    async def _poll_imap_direct(self, timeout: int) -> Optional[str]:
+        """
+        Direct IMAP polling (no proxy) using stdlib imaplib + asyncio.to_thread.
+
+        Follows plan/outlook.py pattern: the entire IMAP session runs inside
+        asyncio.to_thread().  Replaces the old aioimaplib implementation for
+        better reliability and consistency with the proxy path.
+        """
+        import imaplib as _imaplib
+
+        deadline  = time.monotonic() + timeout
         seen_uids: set[str] = set()
 
         logger.info(f"[Outlook/IMAP] Polling {self._email} (timeout={timeout}s)")
 
-        while time.monotonic() < deadline:
-            imap = None
+        def _sync_fetch(access_token: str) -> Optional[str]:
+            """Synchronous IMAP session — runs in thread pool."""
+            # Direct SSL connection (plan/outlook.py: imaplib.IMAP4_SSL)
+            imap_client = _imaplib.IMAP4_SSL(_IMAP_HOST, _IMAP_PORT)
             try:
-                token   = await self._get_token()
-                xoauth2 = _make_xoauth2_token(self._email, token)
+                # XOAUTH2 auth (plan/outlook.py pattern exactly)
+                auth_string = (
+                    f"user={self._email}\x01auth=Bearer {access_token}\x01\x01"
+                ).encode("utf-8")
+                typ, _ = imap_client.authenticate(
+                    "XOAUTH2", lambda x: auth_string
+                )
+                if typ != "OK":
+                    logger.warning(f"[Outlook/IMAP] Auth failed for {self._email}")
+                    return None
 
-                imap = aioimaplib.IMAP4_SSL(host=_IMAP_HOST, port=_IMAP_PORT, timeout=15)
-                await imap.wait_hello_from_server()
-                # aioimaplib.xoauth2(user, raw_access_token) 内部自建 XOAUTH2 SASL 字符串
-                resp = await imap.xoauth2(self._email, token)
-                if resp.result != "OK":
-                    logger.warning(f"[Outlook/IMAP] Auth failed: {resp.result} {resp.lines}")
-                    await asyncio.sleep(5)
-                    continue
+                for folder_name in _IMAP_FOLDERS:
+                    try:
+                        typ, _ = imap_client.select(
+                            f'"{folder_name}"', readonly=True
+                        )
+                        if typ != "OK":
+                            continue
 
-                ok, _ = await imap.select("INBOX")
-                if ok != "OK":
-                    await asyncio.sleep(5)
-                    continue
+                        typ, data = imap_client.search(None, "ALL")
+                        if typ != "OK" or not data or not data[0]:
+                            continue
 
-                ok, data = await imap.search("UNSEEN", charset=None)
-                if ok != "OK":
-                    await asyncio.sleep(4)
-                    continue
+                        uid_list = data[0].decode().split()
+                        for uid in reversed(uid_list):
+                            uid_key = f"{folder_name}/{uid}"
+                            if uid_key in seen_uids:
+                                continue
+                            seen_uids.add(uid_key)
 
-                uid_list: list[str] = []
-                if data and data[0]:
-                    raw = data[0]
-                    if isinstance(raw, bytes):
-                        raw = raw.decode()
-                    uid_list = [u for u in raw.split() if u]
+                            typ2, msg_data = imap_client.fetch(uid, "(RFC822)")
+                            if typ2 != "OK" or not msg_data:
+                                continue
 
-                for uid in uid_list:
-                    if uid in seen_uids:
-                        continue
-                    seen_uids.add(uid)
+                            raw_bytes: Optional[bytes] = None
+                            for part in msg_data:
+                                if isinstance(part, tuple) and len(part) >= 2:
+                                    raw_bytes = part[1]
+                                    break
+                            if not raw_bytes:
+                                continue
 
-                    ok, msg_data = await imap.fetch(uid, "(RFC822)")
-                    if ok != "OK":
-                        continue
+                            msg     = email_lib.message_from_bytes(raw_bytes)
+                            subject = _decode_str(msg.get("Subject", ""))
+                            body    = _extract_text(msg)
+                            code    = _extract_code(f"{subject} {body}")
+                            if code:
+                                logger.info(
+                                    f"[Outlook/IMAP] Code {code} for {self._email}"
+                                    f" (folder={folder_name})"
+                                )
+                                return code
 
-                    raw_bytes: Optional[bytes] = None
-                    for part in msg_data:
-                        if isinstance(part, bytes) and len(part) > 100:
-                            raw_bytes = part
-                            break
-                    if not raw_bytes:
-                        continue
+                    except Exception as exc:
+                        logger.warning(
+                            f"[Outlook/IMAP] folder {folder_name}: {exc!r}"
+                        )
 
-                    msg     = email_lib.message_from_bytes(raw_bytes)
-                    subject = _decode_str(msg.get("Subject", ""))
-                    body    = _extract_text(msg)
-                    code    = _extract_code(f"{subject} {body}")
-                    if code:
-                        logger.info(f"[Outlook/IMAP] Code {code} for {self._email}")
-                        await imap.logout()
-                        return code
+            finally:
+                try:
+                    imap_client.logout()
+                except Exception:
+                    pass
+
+            return None
+
+        while time.monotonic() < deadline:
+            try:
+                token = await self._get_token()
+                code  = await asyncio.to_thread(_sync_fetch, token)
+                if code:
+                    return code
 
             except asyncio.TimeoutError:
                 logger.warning("[Outlook/IMAP] Timeout — retrying")
             except OSError as exc:
-                logger.warning(f"[Outlook/IMAP] Network error [{type(exc).__name__}]: {exc!r}")
+                logger.warning(
+                    f"[Outlook/IMAP] Network error [{type(exc).__name__}]: {exc!r}"
+                )
             except Exception as exc:
                 logger.warning(
-                    f"[Outlook/IMAP] Error [{type(exc).__name__}]: {exc!r} | "
-                    f"args={exc.args!r}"
+                    f"[Outlook/IMAP] Error [{type(exc).__name__}]: {exc!r}"
                 )
-            finally:
-                if imap is not None:
-                    try:
-                        await imap.logout()
-                    except Exception:
-                        pass
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:

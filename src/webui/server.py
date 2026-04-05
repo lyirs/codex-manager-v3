@@ -113,7 +113,7 @@ async def _run_job(job: _Job) -> None:
             base_url = "" if isinstance(mail_raw, list) else mail_raw.get("base_url", "")
             _shared_client = get_mail_client(job.provider, api_key=api_key, base_url=base_url, cfg=cfg)
 
-        def _get_mail_client(n: int):
+        def _get_mail_client(n: int, proxy: Optional[str] = None):
             if _is_imap_provider:
                 _parts = job.provider.split(":")
                 provider_idx = int(_parts[1])
@@ -172,6 +172,9 @@ async def _run_job(job: _Job) -> None:
                     refresh_token = acc.get("refresh_token", ""),
                     access_token  = acc.get("access_token", ""),
                     fetch_method  = acc.get("fetch_method", "graph"),
+                    # Account-level proxy takes priority; fall back to job proxy.
+                    # In mainland China, Microsoft API endpoints require a proxy.
+                    proxy         = acc.get("proxy") or proxy,
                 )
             else:
                 return _shared_client
@@ -190,7 +193,7 @@ async def _run_job(job: _Job) -> None:
                     proxy = await proxy_pool_mod.acquire()
 
                 try:
-                    mail_client = _get_mail_client(n)
+                    mail_client = _get_mail_client(n, proxy)
                 except Exception as exc:
                     job.log(f"Task {n}/{job.count} 邮件客户端错误: {exc}")
                     return

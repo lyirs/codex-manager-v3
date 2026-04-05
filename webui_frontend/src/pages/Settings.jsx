@@ -669,7 +669,7 @@ function TabImap() {
 
 const EMPTY_OUTLOOK = {
   email: '', password: '', client_id: '', tenant_id: 'consumers',
-  refresh_token: '', access_token: '', fetch_method: 'graph',
+  refresh_token: '', access_token: '', fetch_method: 'graph', proxy: '',
 }
 
 const OUTLOOK_IMPORT_HINT = `# 四短线分隔（推荐，每行一条）：
@@ -720,6 +720,16 @@ function OutlookEditModal({ account, onSave, onClose }) {
           </Field>
           <Field label="Access Token" hint="可留空，系统自动获取">
             <Input type="password" value={acc.access_token || ''} onChange={e => set('access_token', e.target.value)} placeholder="（留空自动获取）" />
+          </Field>
+          <Field label="专用代理" hint="Graph/IMAP Token 刷新走此代理；留空则复用任务代理（大陆地区必须配置）">
+            <Input value={acc.proxy || ''} onChange={e => set('proxy', e.target.value)}
+              placeholder="http://127.0.0.1:10808（可选）" />
+            {acc.proxy && (
+              <p className="text-xs text-green-600 mt-1">✓ 已配置代理：{acc.proxy}</p>
+            )}
+            {!acc.proxy && (
+              <p className="text-xs text-amber-500 mt-1">⚠ 未配置专用代理，将使用任务代理（如任务也无代理则直连）</p>
+            )}
           </Field>
         </div>
         <div className="px-6 py-4 border-t border-gray-100 flex items-center justify-end gap-3">
@@ -996,6 +1006,10 @@ function TabOutlook() {
                   }`}>
                     {acc.fetch_method || 'graph'}
                   </span>
+                  {acc.proxy
+                    ? <span className="text-xs px-1.5 py-0.5 rounded bg-purple-100 text-purple-700 flex-shrink-0" title={acc.proxy}>🔀 专用代理</span>
+                    : <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-400 flex-shrink-0">直连/任务代理</span>
+                  }
                 </div>
                 <p className="text-xs text-gray-400 mt-0.5 truncate">
                   {acc.client_id
