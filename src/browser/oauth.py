@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import secrets
@@ -162,6 +163,7 @@ async def acquire_tokens_via_browser(
     timeout: float = 45.0,
     timeouts: Optional[dict] = None,
     mail_client: Optional[MailClient] = None,
+    mobile: bool = False,
 ) -> Optional[TokenResult]:
     """
     Use the browser's existing authenticated session to perform a Codex PKCE
@@ -187,11 +189,17 @@ async def acquire_tokens_via_browser(
                         oauth_token_exchange, otp_code.
         mail_client:  Optional mail client used to poll for the email OTP when
                       Auth0 demands email verification after password login.
+        mobile:       When True, a fresh Chromium context with a mobile
+                      fingerprint (random iOS/Android UA, touch viewport, mobile
+                      stealth JS) is created for the OAuth flow.  Cookies from
+                      the existing ``page`` context are copied across so the
+                      Auth0 session is preserved.  When False (default) the
+                      existing ``page`` is reused as-is.
 
     Returns:
         ``TokenResult`` on success, ``None`` on any failure (always non-fatal).
     """
-    _to   = timeouts or {}
+    _to    = timeouts or {}
     _total = _to.get("oauth_total", timeout)
     verifier, challenge = _generate_pkce()
     state = secrets.token_urlsafe(24)
@@ -209,137 +217,163 @@ async def acquire_tokens_via_browser(
         })
     )
 
-    # ── Register localhost callback interceptor ──────────────────────────────
-    captured: list[str] = []
+    # Choose between a fresh mobile context or the existing page.
+    # contextlib.nullcontext(page) passes ``page`` through unchanged.
+    if mobile:
+        from src.browser.engine import create_oauth_mobile_page
+        _page_ctx = create_oauth_mobile_page(source_page=page, proxy=proxy)
+        logger.info(f"[oauth] Mobile fingerprint mode enabled for {email}")
+    else:
+        _page_ctx = contextlib.nullcontext(page)
 
-    async def _intercept(route):
-        url  = route.request.url
-        code = _extract_code(url)
-        if code:
-            captured.append(code)
-            logger.debug(f"[oauth] Callback intercepted — code len={len(code)}")
-        try:
-            await route.abort()   # localhost doesn't actually exist — just abort
-        except Exception:
-            pass
+    async with _page_ctx as oauth_page:
+        # ── Register localhost callback interceptor ──────────────────────
+        captured: list[str] = []
 
-    await page.route("http://localhost:1455/**", _intercept)
+        async def _intercept(route):
+            url  = route.request.url
+            code = _extract_code(url)
+            if code:
+                captured.append(code)
+                logger.debug(f"[oauth] Callback intercepted — code len={len(code)}")
+            try:
+                await route.abort()   # localhost doesn't actually exist — just abort
+            except Exception:
+                pass
 
-    async def _run_flow() -> Optional[TokenResult]:
-        logger.info(f"[oauth] Starting PKCE OAuth flow for {email}")
+        await oauth_page.route("http://localhost:1455/**", _intercept)
 
-        # ── Navigate to OAuth authorize endpoint ─────────────────────────────
-        try:
-            await page.goto(authorize_url, wait_until="commit",
-                            timeout=int(_to.get("oauth_navigate", 20) * 1000))
-        except Exception as e:
-            err = str(e)
-            if any(s in err for s in ("ERR_CONNECTION_REFUSED", "ERR_ABORTED",
-                                       "net::ERR", "NS_BINDING_ABORTED")):
-                logger.debug("[oauth] Expected localhost navigation error — checking capture")
-            else:
-                logger.debug(f"[oauth] goto exception: {e}")
-
-        if captured:
-            logger.info(f"[oauth] Code immediately captured — exchanging for tokens")
-            return await _exchange_code(captured[0], verifier, email, proxy, _to)
-
-        # ── Handle Auth0 login page ──────────────────────────────────────────
-        await asyncio.sleep(2.0)
-        current_url = page.url
-        logger.debug(f"[oauth] Post-goto URL: {current_url}")
-
-        if "log-in" in current_url or "/login" in current_url:
-            logger.info(f"[oauth] Auth0 login page detected — filling credentials to re-authenticate")
-
-            email_result = await wait_any_element(
-                page,
-                ["input[type='email']", "input[name='email']", "input[name='username']",
-                 "#username", "input[id*='email']"],
-                timeout_ms=int(_to.get("oauth_login_email", 8) * 1000),
+        async def _run_flow() -> Optional[TokenResult]:
+            # Detect fingerprint mode from the page's actual User-Agent so the
+            # log is accurate regardless of whether `mobile` was set explicitly
+            # or inherited from the registration session.
+            try:
+                _ua_snip = await oauth_page.evaluate("() => navigator.userAgent")
+                _fp_label = "mobile" if ("Mobile" in _ua_snip or "Android" in _ua_snip) else "desktop"
+            except Exception:
+                _fp_label = "mobile" if mobile else "desktop"
+            logger.info(
+                f"[oauth] Starting PKCE OAuth flow for {email} [{_fp_label}]"
             )
-            if email_result:
-                e_sel, _ = email_result
-                await set_react_input(page, e_sel, email)
-                logger.debug(f"[oauth] Filled email on login page")
-                await asyncio.sleep(1.0)
-                await click_submit_or_text(page, ["Continue", "Next", "继续", "Submit"])
-                await asyncio.sleep(2.0)
 
-            if password:
-                pw_result = await wait_any_element(
-                    page,
-                    ["input[type='password']", "input[name='password']"],
-                    timeout_ms=int(_to.get("oauth_login_password", 10) * 1000),
+            # ── Navigate to OAuth authorize endpoint ─────────────────────
+            try:
+                await oauth_page.goto(
+                    authorize_url, wait_until="commit",
+                    timeout=int(_to.get("oauth_navigate", 20) * 1000),
                 )
-                if pw_result:
-                    p_sel, _ = pw_result
-                    await set_react_input(page, p_sel, password)
-                    logger.debug(f"[oauth] Filled password on login page")
-                    await asyncio.sleep(1.0)
-                    await click_submit_or_text(
-                        page, ["Continue", "Login", "Sign in", "Submit", "继续"]
-                    )
-                    await asyncio.sleep(3.0)
-
-                    # ── Handle email OTP verification (if Auth0 requires it) ──────
-                    if mail_client:
-                        await _handle_oauth_otp(page, email, mail_client, _to)
+            except Exception as e:
+                err = str(e)
+                if any(s in err for s in ("ERR_CONNECTION_REFUSED", "ERR_ABORTED",
+                                           "net::ERR", "NS_BINDING_ABORTED")):
+                    logger.debug("[oauth] Expected localhost navigation error — checking capture")
                 else:
-                    logger.warning("[oauth] Password input not found on login page")
-            else:
-                logger.warning("[oauth] No password provided — cannot log in via OAuth login page")
-
-        # ── Handle consent / about-you / workspace pages ─────────────────────
-        for attempt in range(1, 8):
-            if captured:
-                logger.info(f"[oauth] Code captured (len={len(captured[0])}) — exchanging for tokens")
-                return await _exchange_code(captured[0], verifier, email, proxy, _to)
-
-            logger.info(f"[oauth] Attempting OAuth flow click-through (try {attempt})")
-
-            if "about-you" in page.url:
-                fn = first_name or "James"
-                ln = last_name or "Smith"
-                bd = birthday or {"year": 1990, "month": 6, "day": 15}
-                logger.info(f"[oauth] About-you page in OAuth flow — filling profile ({fn} {ln})")
-                await _fill_about_you_js(page, fn, ln, bd)
-                await asyncio.sleep(1.5)
-
-            element = await wait_any_element(
-                page, _FLOW_SELECTORS,
-                timeout_ms=int(_to.get("oauth_flow_element", 8) * 1000),
-            )
-            if not element:
-                logger.warning(f"[oauth] No elements found for click-through (try {attempt}) at {page.url}")
-                continue
-
-            matched_sel, btn = element
-            logger.info(f"[oauth] Clicking flow button (sel={matched_sel!r}) at {page.url}")
-            await human_move_and_click(page, btn)
-
-            await asyncio.sleep(3.0)
+                    logger.debug(f"[oauth] goto exception: {e}")
 
             if captured:
-                logger.info(f"[oauth] Code captured (len={len(captured[0])}) — exchanging for tokens")
+                logger.info("[oauth] Code immediately captured — exchanging for tokens")
                 return await _exchange_code(captured[0], verifier, email, proxy, _to)
 
-        logger.warning(f"[oauth] Failed to complete OAuth flow for {email} — code not captured")
-        return None
+            # ── Handle Auth0 login page ──────────────────────────────────
+            await asyncio.sleep(2.0)
+            current_url = oauth_page.url
+            logger.debug(f"[oauth] Post-goto URL: {current_url}")
 
-    try:
-        result = await asyncio.wait_for(_run_flow(), timeout=_total)
-        return result
-    except asyncio.TimeoutError:
-        logger.warning(
-            f"[oauth] OAuth flow timed out after {_total}s for {email}"
-        )
-        return None
-    finally:
+            if "log-in" in current_url or "/login" in current_url:
+                logger.info(
+                    f"[oauth] Auth0 login page detected — filling credentials "
+                    f"({'mobile UA' if mobile else 'desktop UA'})"
+                )
+
+                email_result = await wait_any_element(
+                    oauth_page,
+                    ["input[type='email']", "input[name='email']", "input[name='username']",
+                     "#username", "input[id*='email']"],
+                    timeout_ms=int(_to.get("oauth_login_email", 8) * 1000),
+                )
+                if email_result:
+                    e_sel, _ = email_result
+                    await set_react_input(oauth_page, e_sel, email)
+                    logger.debug("[oauth] Filled email on login page")
+                    await asyncio.sleep(1.0)
+                    await click_submit_or_text(oauth_page, ["Continue", "Next", "继续", "Submit"])
+                    await asyncio.sleep(2.0)
+
+                if password:
+                    pw_result = await wait_any_element(
+                        oauth_page,
+                        ["input[type='password']", "input[name='password']"],
+                        timeout_ms=int(_to.get("oauth_login_password", 10) * 1000),
+                    )
+                    if pw_result:
+                        p_sel, _ = pw_result
+                        await set_react_input(oauth_page, p_sel, password)
+                        logger.debug("[oauth] Filled password on login page")
+                        await asyncio.sleep(1.0)
+                        await click_submit_or_text(
+                            oauth_page, ["Continue", "Login", "Sign in", "Submit", "继续"]
+                        )
+                        await asyncio.sleep(3.0)
+
+                        # ── Handle email OTP verification (if Auth0 requires it) ──
+                        if mail_client:
+                            await _handle_oauth_otp(oauth_page, email, mail_client, _to)
+                    else:
+                        logger.warning("[oauth] Password input not found on login page")
+                else:
+                    logger.warning("[oauth] No password provided — cannot log in via OAuth login page")
+
+            # ── Handle consent / about-you / workspace pages ─────────────
+            for attempt in range(1, 8):
+                if captured:
+                    logger.info(f"[oauth] Code captured (len={len(captured[0])}) — exchanging for tokens")
+                    return await _exchange_code(captured[0], verifier, email, proxy, _to)
+
+                logger.info(f"[oauth] Attempting OAuth flow click-through (try {attempt})")
+
+                if "about-you" in oauth_page.url:
+                    fn = first_name or "James"
+                    ln = last_name or "Smith"
+                    bd = birthday or {"year": 1990, "month": 6, "day": 15}
+                    logger.info(f"[oauth] About-you page — filling profile ({fn} {ln})")
+                    await _fill_about_you_js(oauth_page, fn, ln, bd)
+                    await asyncio.sleep(1.5)
+
+                element = await wait_any_element(
+                    oauth_page, _FLOW_SELECTORS,
+                    timeout_ms=int(_to.get("oauth_flow_element", 8) * 1000),
+                )
+                if not element:
+                    logger.warning(
+                        f"[oauth] No elements found for click-through "
+                        f"(try {attempt}) at {oauth_page.url}"
+                    )
+                    continue
+
+                matched_sel, btn = element
+                logger.info(f"[oauth] Clicking flow button (sel={matched_sel!r}) at {oauth_page.url}")
+                await human_move_and_click(oauth_page, btn)
+
+                await asyncio.sleep(3.0)
+
+                if captured:
+                    logger.info(f"[oauth] Code captured (len={len(captured[0])}) — exchanging for tokens")
+                    return await _exchange_code(captured[0], verifier, email, proxy, _to)
+
+            logger.warning(f"[oauth] Failed to complete OAuth flow for {email} — code not captured")
+            return None
+
         try:
-            await page.unroute("http://localhost:1455/**")
-        except Exception:
-            pass
+            result = await asyncio.wait_for(_run_flow(), timeout=_total)
+            return result
+        except asyncio.TimeoutError:
+            logger.warning(f"[oauth] OAuth flow timed out after {_total}s for {email}")
+            return None
+        finally:
+            try:
+                await oauth_page.unroute("http://localhost:1455/**")
+            except Exception:
+                pass
 
 
 

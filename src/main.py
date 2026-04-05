@@ -16,8 +16,30 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import warnings
 from pathlib import Path
 from typing import Optional
+
+# ── Windows ProactorEventLoop ResourceWarning suppression ─────────────────
+# On Windows, when asyncio.run() closes the event loop, pending pipe transports
+# are GC-ed with already-closed fds, triggering a spurious
+#   "Exception ignored … ValueError: I/O operation on closed pipe"
+# This is a CPython bug (tracked in bpo-23309 / gh-103472) that does NOT
+# affect correctness.  Filter it out here so it doesn't pollute the log.
+if sys.platform == "win32":
+    # Suppress spurious Windows ProactorEventLoop shutdown noise.
+    # Neither of these affects correctness — they fire during GC after the
+    # event loop is already closed (CPython bpo-23309 / gh-103472).
+    warnings.filterwarnings(
+        "ignore",
+        message="unclosed transport",
+        category=ResourceWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="Task was destroyed but it is pending",
+        category=RuntimeWarning,
+    )
 
 import typer
 from loguru import logger
@@ -55,7 +77,7 @@ logger.add(
 # ── Helpers ───────────────────────────────────────────────────────────────
 
 def _ensure_db() -> None:
-    asyncio.run(db_mod.init())
+    _run(db_mod.init())
 
 
 # ── Commands ──────────────────────────────────────────────────────────────
@@ -72,7 +94,7 @@ def register(
 ) -> None:
     """Register N ChatGPT accounts concurrently."""
     _ensure_db()
-    asyncio.run(_register_async(count, engine, provider, concurrency, proxy, headed, slow_mo))
+    _run(_register_async(count, engine, provider, concurrency, proxy, headed, slow_mo))
 
 
 @app.command()
@@ -81,7 +103,7 @@ def list_accounts(
 ) -> None:
     """List all stored accounts."""
     _ensure_db()
-    rows = asyncio.run(accounts_mod.list_all(status or None))
+    rows = _run(accounts_mod.list_all(status or None))
     if not rows:
         console.print("[yellow]No accounts found.[/yellow]")
         return
@@ -113,9 +135,9 @@ def export(
     _ensure_db()
     out_path = Path(output) if output else Path(f"accounts_export.{fmt}")
     if fmt == "csv":
-        n = asyncio.run(accounts_mod.export_csv(out_path))
+        n = _run(accounts_mod.export_csv(out_path))
     else:
-        n = asyncio.run(accounts_mod.export_json(out_path))
+        n = _run(accounts_mod.export_json(out_path))
     console.print(f"[green]Exported {n} accounts → {out_path}[/green]")
 
 
@@ -127,9 +149,9 @@ def import_accounts(
     _ensure_db()
     suffix = file.suffix.lower()
     if suffix == ".json":
-        added, skipped = asyncio.run(accounts_mod.import_json(file))
+        added, skipped = _run(accounts_mod.import_json(file))
     else:
-        added, skipped = asyncio.run(accounts_mod.import_text(file))
+        added, skipped = _run(accounts_mod.import_text(file))
     console.print(f"[green]Imported {added} accounts[/green] (skipped {skipped})")
 
 
@@ -139,9 +161,9 @@ def import_proxies(
 ) -> None:
     """Load proxies from a text file into the database."""
     _ensure_db()
-    n = asyncio.run(proxy_pool_mod.load_from_file(file))
+    n = _run(proxy_pool_mod.load_from_file(file))
     console.print(f"[green]Loaded {n} proxies from {file}[/green]")
-    count = asyncio.run(proxy_pool_mod.active_count())
+    count = _run(proxy_pool_mod.active_count())
     console.print(f"Active proxies in pool: {count}")
 
 
@@ -168,7 +190,7 @@ def config_cmd(
 def db_cmd(action: str = typer.Argument("init", help="Action: init")) -> None:
     """Database management commands."""
     if action == "init":
-        asyncio.run(db_mod.init())
+        _run(db_mod.init())
         console.print(f"[green]DB ready at {db_mod.DB_PATH}[/green]")
     else:
         console.print(f"[red]Unknown action: {action}[/red]")
@@ -289,9 +311,72 @@ async def _register_async(
 
 # ── Entry-point ───────────────────────────────────────────────────────────
 
+def _run(coro):
+    """
+    Drop-in replacement for asyncio.run() with proper Windows cleanup.
+
+    Fixes two Windows-specific noise sources that do NOT affect correctness:
+
+    1. "Task was destroyed but it is pending!" — printed by asyncio's default
+       exception handler when Playwright's internal Connection.run() task is
+       still alive at loop.close() time.  Fix: cancel all pending tasks and
+       let them finish before closing; also install a quiet exception handler
+       that suppresses this specific message if any survive.
+
+    2. "Exception ignored … ValueError: I/O operation on closed pipe" — fired
+       from _ProactorBasePipeTransport.__del__ after the loop is already closed.
+       Fix: cancelling tasks first drains most pipe handles; the warnings filter
+       at module level catches any that slip through GC.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # ── Quiet exception handler ───────────────────────────────────────────
+    # asyncio calls loop.call_exception_handler() (not warnings.warn) for
+    # "Task was destroyed" and some transport errors — install a filter here.
+    _SUPPRESS = (
+        "Task was destroyed but it is pending",
+        "Exception ignored in",
+        "I/O operation on closed pipe",
+        "pipe transport",
+    )
+
+    def _quiet_handler(loop, context):
+        msg = context.get("message", "")
+        if any(s in msg for s in _SUPPRESS):
+            return  # swallow known-harmless Windows shutdown noise
+        loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_quiet_handler)
+
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        # ── Step 1: cancel every pending task (e.g. playwright Connection.run()) ──
+        try:
+            pending = asyncio.all_tasks(loop)
+            if pending:
+                for t in pending:
+                    t.cancel()
+                # Give cancelled tasks one cycle to run their CancelledError handlers
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+        except Exception:
+            pass
+
+        # ── Step 2: drain async-generators and thread-pool executor ──────────
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
+        except Exception:
+            pass
+
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
 if __name__ == "__main__":
     app()
-
-
 
 

@@ -53,6 +53,147 @@ _TIMEZONES = [
     "America/Denver", "Europe/London", "Europe/Berlin",
 ]
 
+# ── Mobile fingerprint pools ──────────────────────────────────────────────
+
+_MOBILE_UAS = [
+    # iOS Safari
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+    # Android Chrome
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
+]
+
+_MOBILE_VIEWPORTS = [
+    # (width, height, device_scale_factor) — portrait
+    {"width": 390, "height": 844, "device_scale_factor": 3.0},    # iPhone 14/15
+    {"width": 430, "height": 932, "device_scale_factor": 3.0},    # iPhone 15 Plus
+    {"width": 412, "height": 915, "device_scale_factor": 2.625},  # Pixel 8
+    {"width": 360, "height": 780, "device_scale_factor": 3.0},    # Samsung S23
+]
+
+# Mobile stealth init-script (replaces _STEALTH_JS for mobile contexts).
+# Sets mobile-appropriate navigator/screen properties from scratch so there
+# are no conflicts with the desktop stealth script.
+_MOBILE_STEALTH_JS = """
+(function() {
+const _ua = navigator.userAgent || '';
+const _isIOS = /iPhone|iPad|iPod/.test(_ua);
+
+// 1. Remove webdriver
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+
+// 2. Mobile platform / language / hardware
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+Object.defineProperty(navigator, 'platform',  {get: () => _isIOS ? 'iPhone' : 'Linux armv8l'});
+Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+Object.defineProperty(navigator, 'deviceMemory',        {get: () => 4});
+Object.defineProperty(navigator, 'maxTouchPoints',      {get: () => 5});
+
+// 3. No plugins on mobile
+Object.defineProperty(navigator, 'plugins',   {get: () => []});
+Object.defineProperty(navigator, 'mimeTypes', {get: () => []});
+
+// 4. Minimal chrome object for Android; omit for iOS Safari
+if (!_isIOS) {
+    window.chrome = {
+        app: {isInstalled: false},
+        runtime: {id: undefined, connect: function(){}, sendMessage: function(){}},
+        csi: function(){},
+        loadTimes: function(){}
+    };
+}
+
+// 5. Permissions
+if (navigator.permissions && navigator.permissions.query) {
+    const _origQuery = navigator.permissions.query.bind(navigator.permissions);
+    navigator.permissions.query = (params) =>
+        params.name === 'notifications'
+            ? Promise.resolve({state: Notification.permission, onchange: null})
+            : _origQuery(params);
+}
+
+// 6. outerWidth/Height (mobile has no chrome chrome)
+if (!window.outerWidth || window.outerWidth === 0) {
+    Object.defineProperty(window, 'outerWidth',  {get: () => window.innerWidth});
+}
+if (!window.outerHeight || window.outerHeight === 0) {
+    Object.defineProperty(window, 'outerHeight', {get: () => window.innerHeight});
+}
+
+// 7. Remove Playwright artefacts
+try { delete window.__playwright; } catch(e){}
+try { delete window.__pw_manual; } catch(e){}
+try { delete window.__playwright_evaluate_expression; } catch(e){}
+
+// 8. Mobile network connection
+if (!navigator.connection) {
+    Object.defineProperty(navigator, 'connection', {
+        get: () => ({rtt: 80, effectiveType: '4g', downlink: 8.5, saveData: false})
+    });
+}
+
+// 9. Mobile WebGL (Adreno / Apple GPU)
+(function() {
+    const _v = _isIOS ? 'Apple Inc.' : 'Qualcomm';
+    const _r = _isIOS ? 'Apple GPU'  : 'Adreno (TM) 740';
+    function _patchCtx(Ctx) {
+        if (!Ctx) return;
+        const _orig = Ctx.prototype.getParameter;
+        Ctx.prototype.getParameter = function(p) {
+            if (p === 37445) return _v;
+            if (p === 37446) return _r;
+            return _orig.call(this, p);
+        };
+    }
+    _patchCtx(window.WebGLRenderingContext);
+    _patchCtx(window.WebGL2RenderingContext);
+})();
+
+// 10. Canvas noise
+(function() {
+    const _origGID = CanvasRenderingContext2D.prototype.getImageData;
+    CanvasRenderingContext2D.prototype.getImageData = function(sx, sy, sw, sh) {
+        const d = _origGID.call(this, sx, sy, sw, sh);
+        for (let i = 0; i < d.data.length; i += 4) {
+            d.data[i]   ^= (Math.random() < 0.3 ? 1 : 0);
+            d.data[i+1] ^= (Math.random() < 0.3 ? 1 : 0);
+            d.data[i+2] ^= (Math.random() < 0.3 ? 1 : 0);
+        }
+        return d;
+    };
+})();
+
+// 11. Portrait orientation
+try { Object.defineProperty(window, 'orientation', {get: () => 0}); } catch(e){}
+
+// 12. Screen matches mobile viewport
+(function() {
+    const W = window.innerWidth  || 390;
+    const H = window.innerHeight || 844;
+    try { Object.defineProperty(screen, 'width',       {get: () => W}); } catch(e){}
+    try { Object.defineProperty(screen, 'height',      {get: () => H}); } catch(e){}
+    try { Object.defineProperty(screen, 'availWidth',  {get: () => W}); } catch(e){}
+    try { Object.defineProperty(screen, 'availHeight', {get: () => H}); } catch(e){}
+})();
+
+// 13. Conceal automation stack frames
+(function() {
+    const _origPrepare = Error.prepareStackTrace;
+    Error.prepareStackTrace = function(err, stack) {
+        const filtered = stack.filter(f => {
+            const src = f.getFileName() || '';
+            return !src.includes('playwright') && !src.includes('__pw_');
+        });
+        return _origPrepare ? _origPrepare(err, filtered) : filtered.map(f => '    at ' + f).join('\\n');
+    };
+})();
+
+})(); // end IIFE
+"""
+
 # Stealth init-script injected into every Chromium page.
 # Covers the most common headless-Chromium fingerprint leaks that
 # Auth0 / Cloudflare bot-detection scripts probe.
@@ -251,6 +392,7 @@ async def create_page(
     proxy: Optional[str] = None,
     headless: bool = True,
     slow_mo: int = 0,
+    mobile: bool = False,
 ):
     """
     Async context manager that yields a ready-to-use playwright Page.
@@ -263,31 +405,130 @@ async def create_page(
     headless : True  → invisible batch mode (default)
                False → visible headed window (debug / manual-assist mode)
     slow_mo  : extra delay in ms between actions (useful in headed mode, e.g. 80)
+    mobile   : True → emulate a mobile device fingerprint.
+               Playwright: uses a random iOS/Android UA, portrait viewport,
+                 is_mobile=True, has_touch=True, and _MOBILE_STEALTH_JS.
+               Camoufox: uses a mobile-sized window + screen constraints
+                 (camoufox is Firefox-based and has no Android OS support,
+                 so the UA stays Firefox/Linux but the viewport is mobile-sized).
     """
     proxy_cfg = _parse_proxy(proxy) if proxy else None
     viewport  = random.choice(_VIEWPORTS)
     timezone  = random.choice(_TIMEZONES)
 
     mode_label = "headless" if headless else "HEADED"
+    mobile_label = " [MOBILE]" if mobile else ""
     logger.info(
         f"[engine] {engine} launching "
-        f"[{mode_label}, proxy={bool(proxy_cfg)}, slow_mo={slow_mo}ms]"
+        f"[{mode_label}{mobile_label}, proxy={bool(proxy_cfg)}, slow_mo={slow_mo}ms]"
     )
 
     if engine == "camoufox":
-        async with _camoufox_page(proxy_cfg, viewport, headless, slow_mo) as page:
+        async with _camoufox_page(proxy_cfg, viewport, headless, slow_mo, mobile=mobile) as page:
             yield page
     else:
-        async with _playwright_page(proxy_cfg, viewport, timezone, headless, slow_mo) as page:
+        async with _playwright_page(proxy_cfg, viewport, timezone, headless, slow_mo, mobile=mobile) as page:
             yield page
 
 
 @asynccontextmanager
-async def _camoufox_page(proxy_cfg, viewport, headless: bool, slow_mo: int):
+async def create_oauth_mobile_page(
+    source_page,
+    proxy: Optional[str] = None,
+    headless: bool = True,
+    slow_mo: int = 0,
+):
+    """
+    Async context manager — yields a fresh Chromium page with a **mobile**
+    browser fingerprint, intended for the OAuth PKCE login flow.
+
+    Cookies from ``source_page``'s browser context are copied into the new
+    mobile context so any existing auth.openai.com session is preserved and
+    Auth0 can skip re-authentication when cookies are still valid.
+
+    Mobile characteristics:
+      • Random iOS Safari or Android Chrome User-Agent
+      • Portrait viewport matching a real device (390×844 … 412×915)
+      • ``is_mobile=True``, ``has_touch=True``, ``device_scale_factor`` set
+      • ``_MOBILE_STEALTH_JS`` patches navigator.platform, maxTouchPoints,
+        WebGL GPU strings, canvas noise, screen size, etc.
+    """
+    import sys
+    from playwright.async_api import async_playwright
+
+    proxy_cfg = _parse_proxy(proxy) if proxy else None
+    mv  = random.choice(_MOBILE_VIEWPORTS)
+    ua  = random.choice(_MOBILE_UAS)
+    tz  = random.choice(_TIMEZONES)
+
+    launch_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--disable-infobars",
+        "--disable-notifications",
+        "--disable-popup-blocking",
+    ]
+    if sys.platform.startswith("linux"):
+        launch_args += ["--no-sandbox", "--disable-dev-shm-usage"]
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=headless,
+            slow_mo=slow_mo,
+            proxy=proxy_cfg,
+            args=launch_args,
+        )
+        context = await browser.new_context(
+            user_agent=ua,
+            viewport={"width": mv["width"], "height": mv["height"]},
+            device_scale_factor=mv["device_scale_factor"],
+            is_mobile=True,
+            has_touch=True,
+            locale="en-US",
+            timezone_id=tz,
+            java_script_enabled=True,
+        )
+        # Transfer cookies from the registration session so Auth0 sees the
+        # same logged-in state in the mobile context.
+        try:
+            cookies = await source_page.context.cookies()
+            if cookies:
+                await context.add_cookies(cookies)
+                logger.info(
+                    f"[engine] Mobile OAuth context — transferred {len(cookies)} cookies"
+                )
+        except Exception as exc:
+            logger.warning(f"[engine] Cookie transfer to mobile context failed: {exc}")
+
+        await context.add_init_script(_MOBILE_STEALTH_JS)
+        page = await context.new_page()
+        logger.info(
+            f"[engine] Mobile OAuth context launched — "
+            f"ua={ua[:55]}…  vp={mv['width']}×{mv['height']}"
+        )
+        try:
+            yield page
+        finally:
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+
+@asynccontextmanager
+async def _camoufox_page(proxy_cfg, viewport, headless: bool, slow_mo: int, mobile: bool = False):
     """Launch a camoufox (Firefox) page with realistic fingerprinting.
 
     Supported launch_options: os, locale, block_webrtc, humanize, window, geoip, proxy, headless
     Note: 'timezone' and 'viewport' are NOT accepted — use 'window' and 'geoip' instead.
+
+    Mobile mode: sets a portrait mobile window size and constrains the BrowserForge
+    screen fingerprint to mobile dimensions.  Camoufox is Firefox-based so there is
+    no Android OS support; the UA stays Firefox/Linux but the viewport matches a real
+    mobile device screen.
     """
     try:
         from camoufox.async_api import AsyncCamoufox  # type: ignore
@@ -297,14 +538,31 @@ async def _camoufox_page(proxy_cfg, viewport, headless: bool, slow_mo: int):
             "Run:  uv run python -m camoufox fetch"
         ) from exc
 
-    # Randomize OS — Windows is most common, include macOS for variety
-    os_choice = random.choice(["windows", "windows", "windows", "macos"])
+    extra_kwargs: dict = {}
+
+    if mobile:
+        # Choose a random mobile viewport; use Linux (closest to Android in terms of
+        # BrowserForge OS pool) and constrain screen to mobile dimensions.
+        mv = random.choice(_MOBILE_VIEWPORTS)
+        win_size = (mv["width"], mv["height"])
+        os_choice = "linux"
+        try:
+            from browserforge.fingerprints import Screen as _BFScreen  # type: ignore
+            extra_kwargs["screen"] = _BFScreen(
+                max_width=mv["width"] + 30,
+                max_height=mv["height"] + 30,
+            )
+        except Exception:
+            pass  # BrowserForge Screen not available — window size alone is enough
+    else:
+        # Randomize OS — Windows is most common, include macOS for variety
+        os_choice = random.choice(["windows", "windows", "windows", "macos"])
+        win_size = (viewport["width"], viewport["height"])
 
     # geoip=True: camoufox resolves real timezone/locale from proxy's exit IP
     # humanize=True: built-in human-like timing for mouse events (helps vs bot-detect)
     # block_webrtc=True: prevent WebRTC from leaking local IP through proxy
     # window expects (width, height) tuple, NOT a dict
-    win_size = (viewport["width"], viewport["height"])
     async with AsyncCamoufox(
         headless=headless,
         proxy=proxy_cfg,
@@ -314,6 +572,7 @@ async def _camoufox_page(proxy_cfg, viewport, headless: bool, slow_mo: int):
         humanize=True,
         window=win_size,          # (width, height) tuple
         geoip=proxy_cfg is not None,
+        **extra_kwargs,
     ) as browser:
         page = await browser.new_page()
         if slow_mo > 0:
@@ -332,12 +591,31 @@ async def _camoufox_page(proxy_cfg, viewport, headless: bool, slow_mo: int):
 
 
 @asynccontextmanager
-async def _playwright_page(proxy_cfg, viewport, timezone, headless: bool, slow_mo: int):
-    """Launch a Chromium page via playwright with stealth patches."""
+async def _playwright_page(proxy_cfg, viewport, timezone, headless: bool, slow_mo: int, mobile: bool = False):
+    """Launch a Chromium page via playwright with stealth patches.
+
+    Mobile mode: uses a random iOS/Android User-Agent, a portrait mobile viewport
+    (is_mobile=True, has_touch=True, device_scale_factor), and injects
+    _MOBILE_STEALTH_JS instead of the desktop _STEALTH_JS.
+    """
     import sys
     from playwright.async_api import async_playwright  # type: ignore
 
-    ua = random.choice(_CHROMIUM_UAS)
+    if mobile:
+        mv  = random.choice(_MOBILE_VIEWPORTS)
+        ua  = random.choice(_MOBILE_UAS)
+        vp  = {"width": mv["width"], "height": mv["height"]}
+        stealth_js = _MOBILE_STEALTH_JS
+        ctx_extra: dict = {
+            "device_scale_factor": mv["device_scale_factor"],
+            "is_mobile":           True,
+            "has_touch":           True,
+        }
+    else:
+        ua  = random.choice(_CHROMIUM_UAS)
+        vp  = viewport
+        stealth_js = _STEALTH_JS
+        ctx_extra = {}
 
     # Core anti-detect flag — always needed.
     # --no-sandbox is a strong automation signal AND unnecessary on Windows;
@@ -361,12 +639,13 @@ async def _playwright_page(proxy_cfg, viewport, timezone, headless: bool, slow_m
         )
         context = await browser.new_context(
             user_agent=ua,
-            viewport=viewport,
+            viewport=vp,
             locale="en-US",
             timezone_id=timezone,
             java_script_enabled=True,
+            **ctx_extra,
         )
-        await context.add_init_script(_STEALTH_JS)
+        await context.add_init_script(stealth_js)
         page = await context.new_page()
         try:
             yield page

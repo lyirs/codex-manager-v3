@@ -15,6 +15,7 @@ _DEFAULTS: dict[str, Any] = {
     "engine": "playwright",
     "headless": True,          # True = invisible batch mode; False = visible headed window
     "slow_mo": 0,              # extra ms between actions; 0 = auto (80 ms when headed)
+    "mobile": False,           # True = use mobile fingerprint for the entire registration flow
     "max_concurrent": 2,
     "mail_provider": "gptmail",
     "mail": {

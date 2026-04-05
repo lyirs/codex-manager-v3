@@ -56,6 +56,20 @@ MAX_RETRIES  = 5
 # Fallback timeout constants — overridden at runtime by cfg["timeouts"] values.
 CODE_TIMEOUT = 180   # seconds to poll for OTP e-mail (default; see timeouts.otp_code)
 
+# Transient network error substrings that should trigger a retry rather than abort.
+_NETWORK_ERRORS = (
+    "NS_ERROR_NET_RESET",
+    "NS_ERROR_CONNECTION_REFUSED",
+    "NS_ERROR_NET_TIMEOUT",
+    "NS_BINDING_ABORTED",
+    "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_REFUSED",
+    "ERR_TIMED_OUT",
+    "ERR_EMPTY_RESPONSE",
+    "net::ERR",
+    "TimeoutError",
+)
+
 # Email selectors — mirrors tool.js GOTO_SIGNUP + FILL_EMAIL order
 _EMAIL_SELECTORS = [
     "input[type='email']",
@@ -158,6 +172,33 @@ class FatalRegistrationError(Exception):
     """Raised when registration cannot be retried (e.g. email creation failed)."""
 
 
+# ── Network-safe navigation ────────────────────────────────────────────────
+
+async def _safe_goto(
+    task_id: str,
+    page: Page,
+    url: str,
+    *,
+    wait_until: str = "domcontentloaded",
+    timeout_ms: int = 60_000,
+) -> None:
+    """
+    Navigate to *url*, converting transient network errors (NS_ERROR_NET_RESET,
+    ERR_CONNECTION_RESET, etc.) into ``RegistrationError`` so the outer retry
+    loop handles them gracefully with proper back-off instead of treating them
+    as fatal "Unexpected error" events.
+    """
+    try:
+        await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+    except Exception as exc:
+        err = str(exc)
+        if any(s in err for s in _NETWORK_ERRORS):
+            raise RegistrationError(
+                f"Transient network error navigating to {url}: {exc}"
+            ) from exc
+        raise
+
+
 # ── Public entry-point ─────────────────────────────────────────────────────
 
 async def register_one(
@@ -182,8 +223,27 @@ async def register_one(
     headless  = cfg.get("headless", True)
     slow_mo   = cfg.get("slow_mo", 0)
     timeouts  = cfg.get("timeouts", {})
+    mobile    = bool(cfg.get("mobile", False))
     if not headless and slow_mo == 0:
         slow_mo = 80
+
+    # ── Backward-compat: merge legacy 'timeout' (singular) keys into 'timeouts' ──
+    # config.yaml used to have `timeout:` (singular); code reads `timeouts:` (plural).
+    # Map the known keys so existing configs keep working.
+    _legacy = cfg.get("timeout", {})
+    if _legacy:
+        _KEY_MAP = {
+            "email_input":    "email_input",
+            "password_input": "password_input",
+            "otp_input":      "otp_input",
+            "profile_input":  "profile_detect",
+            "code_poll":      "otp_code",
+            "page_load":      "page_load",
+        }
+        timeouts = dict(timeouts)   # don't mutate cfg in-place
+        for old_k, new_k in _KEY_MAP.items():
+            if old_k in _legacy and new_k not in timeouts:
+                timeouts[new_k] = _legacy[old_k]
 
     logger.info(f"[{task_id}] Creating e-mail via {cfg.get('mail_provider', 'gptmail')}")
     try:
@@ -204,7 +264,7 @@ async def register_one(
         "createdAt": datetime.now(timezone.utc).isoformat(),
     }
 
-    async with create_page(engine=engine, proxy=proxy, headless=headless, slow_mo=slow_mo) as page:
+    async with create_page(engine=engine, proxy=proxy, headless=headless, slow_mo=slow_mo, mobile=mobile) as page:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 logger.info(f"[{task_id}] Attempt {attempt}/{MAX_RETRIES} — {email}")
@@ -214,9 +274,10 @@ async def register_one(
 
                 # ── Post-registration: Codex OAuth token acquisition ──────────
                 # The browser still holds valid auth.openai.com cookies from the
-                # completed registration session.  Re-using the same page means
-                # Auth0 can skip re-authentication and go straight to the PKCE
-                # consent / workspace-select step.
+                # completed registration session.  Re-using the SAME page means
+                # Auth0 can skip re-authentication, and the fingerprint (desktop
+                # or mobile, depending on the top-level `mobile` config) is
+                # already set — no need for a separate mobile context.
                 if cfg.get("enable_oauth", True):
                     try:
                         from src.browser.oauth import acquire_tokens_via_browser
@@ -230,6 +291,7 @@ async def register_one(
                             proxy=proxy,
                             timeouts=timeouts,
                             mail_client=mail_client,
+                            mobile=False,   # page already carries the correct fingerprint
                         )
                         if token:
                             account.update(token.to_dict())
@@ -251,22 +313,32 @@ async def register_one(
                 return account
 
             except RegistrationError as exc:
-                logger.warning(f"[{task_id}] Retry {attempt}: {exc}")
+                logger.warning(f"[{task_id}] Retry {attempt}/{MAX_RETRIES}: {exc}")
                 if attempt < MAX_RETRIES:
-                    await asyncio.sleep(3 * attempt)
+                    # Exponential back-off: 10 s, 20 s, 30 s, 40 s … capped at 60 s
+                    backoff = min(10 * attempt, 60)
+                    logger.info(f"[{task_id}] Waiting {backoff}s before retry …")
+                    await asyncio.sleep(backoff)
                     try:
-                        await page.goto(LOGIN_URL, wait_until="domcontentloaded",
-                                        timeout=int(timeouts.get("page_load", 30) * 1000))
+                        await _safe_goto(task_id, page, LOGIN_URL,
+                                         timeout_ms=int(timeouts.get("page_load", 60) * 1000))
                     except Exception:
                         pass
 
             except Exception as exc:
-                logger.error(f"[{task_id}] Unexpected error (attempt {attempt}): {exc}")
+                err_str = str(exc)
+                is_network = any(s in err_str for s in _NETWORK_ERRORS)
+                if is_network:
+                    logger.warning(f"[{task_id}] Network error (attempt {attempt}): {exc}")
+                else:
+                    logger.error(f"[{task_id}] Unexpected error (attempt {attempt}): {exc}")
                 if attempt < MAX_RETRIES:
-                    await asyncio.sleep(5)
+                    backoff = min(10 * attempt, 60) if is_network else min(5 * attempt, 30)
+                    logger.info(f"[{task_id}] Waiting {backoff}s before retry …")
+                    await asyncio.sleep(backoff)
                     try:
-                        await page.goto(LOGIN_URL, wait_until="domcontentloaded",
-                                        timeout=int(timeouts.get("page_load", 30) * 1000))
+                        await _safe_goto(task_id, page, LOGIN_URL,
+                                         timeout_ms=int(timeouts.get("page_load", 60) * 1000))
                     except Exception:
                         pass
 
@@ -292,8 +364,8 @@ async def _state_machine(
     # tool.js: window.location.href = 'https://chatgpt.com/auth/login'
     # NextAuth 302-redirects → auth.openai.com Universal Login
     logger.info(f"[{task_id}] GOTO_SIGNUP → {LOGIN_URL}")
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded",
-                    timeout=int(timeouts.get("page_load", 30) * 1000))
+    await _safe_goto(task_id, page, LOGIN_URL,
+                     timeout_ms=int(timeouts.get("page_load", 60) * 1000))
 
     # Wait for Auth0 redirect (usually < 5 s)
     try:
