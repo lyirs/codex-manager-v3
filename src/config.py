@@ -22,6 +22,20 @@ _DEFAULTS: dict[str, Any] = {
         "gptmail":  {"api_key": "", "base_url": "https://mail.chatgpt.org.uk"},
         "npcmail":  {"api_key": "", "base_url": "https://dash.xphdfs.me"},
         "yydsmail": {"api_key": "", "base_url": "https://maliapi.215.im/v1"},
+        # imap: list of one or more IMAP accounts.
+        # qq.com and gmail.com domains automatically enable '+alias' mode.
+        # Set use_alias: true/false explicitly to override auto-detection.
+        "imap": [
+            {
+                "email":     "",       # full mailbox address, e.g. user@gmail.com
+                "password":  "",       # IMAP account password (Gmail: app-specific password)
+                "host":      "",       # IMAP server hostname, e.g. imap.gmail.com
+                "port":      993,      # 993 = IMAPS (SSL), 143 = STARTTLS / plain
+                "ssl":       True,     # True = IMAPS; False = STARTTLS / plain
+                "folder":    "INBOX",  # folder to watch for verification emails
+                # "use_alias": None,   # None = auto-detect from domain
+            },
+        ],
     },
     "registration": {"prefix": "", "domain": ""},
     "proxy_strategy": "pool",

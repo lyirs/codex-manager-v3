@@ -86,7 +86,7 @@ def _ensure_db() -> None:
 def register(
     count: int = typer.Option(1,  "--count",    "-n", help="Number of accounts to register"),
     engine: str = typer.Option("", "--engine",  "-e", help="Browser engine: playwright | camoufox"),
-    provider: str = typer.Option("", "--provider", "-p", help="Mail provider: gptmail | npcmail | yydsmail"),
+    provider: str = typer.Option("", "--provider", "-p", help="Mail provider: gptmail | npcmail | yydsmail | imap"),
     concurrency: int = typer.Option(0, "--concurrency", "-c", help="Max parallel browsers (0 = use config)"),
     proxy: str = typer.Option("", "--proxy", "-x", help="Static proxy URL to use for this run, e.g. http://user:pass@host:port"),
     headed: bool = typer.Option(False, "--headed/--headless", help="Run with a visible browser window (headed mode)"),
@@ -229,7 +229,9 @@ async def _register_async(
     cfg["headless"] = headless
     cfg["slow_mo"]  = slow_mo
 
-    mail_cfg = (cfg.get("mail") or {}).get(provider, {})
+    # Strip optional ':index' suffix (e.g. "imap:0" → "imap") for config-dict lookup.
+    provider_base = provider.split(":")[0]
+    mail_cfg = (cfg.get("mail") or {}).get(provider_base, {})
     api_key  = mail_cfg.get("api_key", "")
     base_url = mail_cfg.get("base_url", "")
 

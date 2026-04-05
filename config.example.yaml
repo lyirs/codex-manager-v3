@@ -13,8 +13,14 @@ engine: playwright
 max_concurrent: 2
 
 # ── 邮件服务 ───────────────────────────────────────────────────────────────
-# 选择一个临时邮件服务来接收 ChatGPT 验证码
-# 可选值: gptmail | npcmail | yydsmail
+# 选择一个邮件服务来接收 ChatGPT 验证码
+# 可选值: gptmail | npcmail | yydsmail | imap
+#
+# imap  — 使用你自己的真实邮箱（Gmail / QQ 等）通过 IMAP 协议收信
+#         - qq.com / gmail.com 域名自动启用 "+别名" 模式
+#           （每次注册生成唯一别名地址，如 user+abc123@gmail.com）
+#           所有别名邮件仍投递到同一收件箱，poll_code 会按 To: 头部区分
+#         - 支持配置多个账户（列表格式），多账户时随机选取一个
 mail_provider: gptmail
 
 mail:
@@ -36,6 +42,32 @@ mail:
   yydsmail:
     api_key: ""
     base_url: "https://maliapi.215.im/v1"
+
+  # IMAP — 使用自有真实邮箱收信（支持多账户）
+  # ┌─ Gmail 示例 ────────────────────────────────────────────────────────────
+  # │  1. 前往 Google 账户 → 安全性 → 应用专用密码，生成一个 16 位密码
+  # │  2. Gmail 需在设置中启用 IMAP（设置 → 转发和 POP/IMAP → 启用 IMAP）
+  # │  3. qq.com / gmail.com 自动启用 "+别名" 模式，无需额外配置
+  # └─────────────────────────────────────────────────────────────────────────
+  # ┌─ QQ 邮箱示例 ───────────────────────────────────────────────────────────
+  # │  1. QQ 邮箱 → 设置 → 账户 → 开启 IMAP 服务，获取授权码（非登录密码）
+  # │  2. host: imap.qq.com  port: 993  ssl: true
+  # └─────────────────────────────────────────────────────────────────────────
+  imap:
+    - email:    "user@gmail.com"     # 你的完整邮箱地址
+      password: "abcd efgh ijkl mnop"  # Gmail 应用专用密码（16 位，含空格也可）
+      host:     "imap.gmail.com"
+      port:     993                  # 993=IMAPS(SSL) | 143=STARTTLS
+      ssl:      true
+      folder:   INBOX
+      # use_alias: true              # 不填 → qq.com/gmail.com 自动启用别名模式
+    # 第二个账户示例（可选，多账户随机轮换）:
+    # - email:    "myqq@qq.com"
+    #   password: "xxxxxxxxxxxxxx"   # QQ 邮箱授权码
+    #   host:     "imap.qq.com"
+    #   port:     993
+    #   ssl:      true
+    #   folder:   INBOX
 
 # ── 邮箱生成规则 ───────────────────────────────────────────────────────────
 registration:
