@@ -132,6 +132,11 @@ class OutlookMailClient(MailClient):
         self._fetch_method  = fetch_method
         self._proxy         = proxy        # forwarded to every httpx client
         self._token_expiry  = 0.0   # Unix timestamp; 0 = always refresh
+        # Instance-level UID/ID tracking — persists across poll_code() calls so
+        # the registration OTP mail is not re-returned during the subsequent
+        # OAuth login OTP poll.
+        self._seen_imap_uids: set[str] = set()
+        self._seen_graph_ids: set[str] = set()
 
     # ── httpx factory ─────────────────────────────────────────────────────
 
@@ -272,7 +277,9 @@ class OutlookMailClient(MailClient):
         import ssl as _ssl
 
         deadline  = time.monotonic() + timeout
-        seen_ids: set[str] = set()
+        # Use instance-level tracking so registration OTP IDs are not re-returned
+        # during the OAuth login OTP poll on the same client instance.
+        seen_ids  = self._seen_graph_ids
 
         _GRAPH_FOLDERS = [
             (_GRAPH_MESSAGES_URL, "inbox"),
@@ -375,7 +382,9 @@ class OutlookMailClient(MailClient):
         proxy_port = p.port or 8080
 
         deadline  = time.monotonic() + timeout
-        seen_uids: set[str] = set()
+        # Use instance-level tracking so registration OTP UIDs are not re-returned
+        # when poll_code() is called again for the OAuth login OTP.
+        seen_uids = self._seen_imap_uids
 
         logger.info(
             f"[Outlook/IMAP-proxy] Polling {self._email} "
@@ -545,7 +554,7 @@ class OutlookMailClient(MailClient):
         import imaplib as _imaplib
 
         deadline  = time.monotonic() + timeout
-        seen_uids: set[str] = set()
+        seen_uids = self._seen_imap_uids   # instance-level, persists across calls
 
         logger.info(f"[Outlook/IMAP] Polling {self._email} (timeout={timeout}s)")
 

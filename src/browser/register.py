@@ -497,8 +497,10 @@ async def _state_machine(
 
     # ── STATE: FILL_PASSWORD ──────────────────────────────────────────
     # After email submit, detect if page shows password input OR OTP verification.
-    # If OTP appears (no password form) → skip this email (non-retryable).
-    _step(4, "等待密码输入框（检测是否需要 OTP 验证）")
+    # Some accounts (or certain Auth0 tenant configurations) skip the password
+    # step entirely and go straight to OTP — we continue the registration in
+    # that case rather than aborting.
+    _step(4, "等待密码输入框（或直接进入 OTP 验证环节）")
     logger.info(f"[{task_id}] FILL_PASSWORD — waiting for password or OTP (≤{timeouts.get('password_input', 60)} s)")
 
     detected = await _wait_for_password_or_otp(
@@ -510,69 +512,83 @@ async def _state_machine(
             f"邮箱 {account['email']} 已注册（Auth0 跳转至登录密码页 /log-in/password）"
         )
     elif detected == "otp":
-        raise SkipRegistrationError(
-            f"OTP 验证页面出现（非密码注册流程），跳过此邮箱. URL={page.url}"
+        # Auth0 skipped the password step and went straight to OTP verification.
+        # This is a valid registration path — continue to WAIT_CODE directly.
+        _step(4, "Auth0 直接跳转到 OTP 验证（无密码步骤），继续填写验证码")
+        logger.info(
+            f"[{task_id}] OTP page detected immediately after email "
+            "(no password step) — jumping to WAIT_CODE"
         )
+        # otp_already_visible = True  → skip _wait_for_otp_inputs below
+        skip_pw_to_otp = True
     elif detected == "none":
         raise RegistrationError(
             f"Password input not found after email submit. URL={page.url}"
         )
-
-    # detected == "password"
-    pw_result = await wait_any_element(
-        page, _PASSWORD_SELECTORS, timeout_ms=3000,
-    )
-    if not pw_result:
-        raise RegistrationError(f"Password input not found (post-detect). URL={page.url}")
-    await _assert_not_error(task_id, page)
-
-    matched_pw_sel, pw_el = pw_result
-    logger.debug(f"[{task_id}] Password input matched: {matched_pw_sel!r}")
-
-    # tool.js: _0x1ae(0x1f4) — 0.5 s before fill, add jitter
-    await jitter_sleep(0.5, 0.2)
-
-    # tool.js: _0x1c0(pi, d.password)
-    await set_react_input(page, matched_pw_sel, account["password"])
-    logger.debug(f"[{task_id}] Password filled")
-
-    # tool.js: _0x1ae(0x3e8) — 1 s then click submit (human simulation)
-    await jitter_sleep(1.0, 0.3)
-    pw_sub_loc = None
-    try:
-        pw_sub = page.locator("button[type='submit']").first
-        if await pw_sub.is_visible():
-            pw_sub_loc = pw_sub
-    except Exception:
-        pass
-
-    if pw_sub_loc:
-        await human_move_and_click(page, pw_sub_loc)
-        submitted_pw = True
     else:
-        submitted_pw = await click_submit_or_text(page, ["Continue", "继续", "Next", "Submit"])
-    if not submitted_pw:
+        skip_pw_to_otp = False
+
+    if not skip_pw_to_otp:
+        # detected == "password"
+        pw_result = await wait_any_element(
+            page, _PASSWORD_SELECTORS, timeout_ms=3000,
+        )
+        if not pw_result:
+            raise RegistrationError(f"Password input not found (post-detect). URL={page.url}")
+        await _assert_not_error(task_id, page)
+
+        matched_pw_sel, pw_el = pw_result
+        logger.debug(f"[{task_id}] Password input matched: {matched_pw_sel!r}")
+
+        # tool.js: _0x1ae(0x1f4) — 0.5 s before fill, add jitter
+        await jitter_sleep(0.5, 0.2)
+
+        # tool.js: _0x1c0(pi, d.password)
+        await set_react_input(page, matched_pw_sel, account["password"])
+        logger.debug(f"[{task_id}] Password filled")
+
+        # tool.js: _0x1ae(0x3e8) — 1 s then click submit (human simulation)
+        await jitter_sleep(1.0, 0.3)
+        pw_sub_loc = None
         try:
-            await pw_el.press("Enter")
+            pw_sub = page.locator("button[type='submit']").first
+            if await pw_sub.is_visible():
+                pw_sub_loc = pw_sub
         except Exception:
             pass
 
-    logger.debug(f"[{task_id}] Password submitted — waiting for OTP page")
+        if pw_sub_loc:
+            await human_move_and_click(page, pw_sub_loc)
+            submitted_pw = True
+        else:
+            submitted_pw = await click_submit_or_text(page, ["Continue", "继续", "Next", "Submit"])
+        if not submitted_pw:
+            try:
+                await pw_el.press("Enter")
+            except Exception:
+                pass
+
+        logger.debug(f"[{task_id}] Password submitted — waiting for OTP page")
 
     # ── STATE: WAIT_CODE ──────────────────────────────────────────────
     # tool.js: _0x98d wait loop — checks for input[maxlength="1"] or
     # autocomplete="one-time-code" every 1 s, up to 60 s
     _step(5, f"等待验证码邮件（轮询收件箱，超时 {timeouts.get('otp_code', 180)}s）")
-    logger.info(f"[{task_id}] WAIT_CODE — waiting for OTP inputs (≤{timeouts.get('otp_input', 60)} s)")
-    otp_appeared = await _wait_for_otp_inputs(
-        page, timeout_ms=int(timeouts.get("otp_input", 60) * 1000),
-    )
-    if not otp_appeared:
-        raise RegistrationError(
-            f"OTP input did not appear after password submit. URL={page.url}"
+
+    if skip_pw_to_otp:
+        # OTP inputs are already visible — no need to wait for them to appear
+        logger.info(f"[{task_id}] WAIT_CODE — OTP inputs already visible (no-password path)")
+    else:
+        logger.info(f"[{task_id}] WAIT_CODE — waiting for OTP inputs (≤{timeouts.get('otp_input', 60)} s)")
+        otp_appeared = await _wait_for_otp_inputs(
+            page, timeout_ms=int(timeouts.get("otp_input", 60) * 1000),
         )
+        if not otp_appeared:
+            raise RegistrationError(
+                f"OTP input did not appear after password submit. URL={page.url}"
+            )
     await _assert_not_error(task_id, page)
-    logger.info(f"[{task_id}] OTP page loaded — polling gptmail inbox")
+    logger.info(f"[{task_id}] OTP page loaded — polling mail inbox")
 
     # tool.js: _0xa9e — poll gptmail every 3 s up to 60 iterations
     # If no code arrives within timeout, click the "Resend" button and retry
@@ -609,16 +625,72 @@ async def _state_machine(
 
     # ── STATE: FILL_CODE ──────────────────────────────────────────────
     # tool.js: _0xbaf(c, d) — fill individual digit boxes or single field
-    await _fill_otp(page, code)
-    await jitter_sleep(1.0, 0.3)  # _0x1ae(0x3e8)
+    # If Auth0 returns "Incorrect code", click Resend, fetch a NEW code from
+    # mail (different from the last one), and retry.
+    _OTP_WRONG_MAX = 2
+    _otp_ok = False
+    _otp_failure_reason: Optional[str] = None
 
-    submitted_otp = await click_submit_or_text(
-        page, ["Continue", "Verify", "Submit", "继续"]
-    )
-    if not submitted_otp:
-        logger.debug(f"[{task_id}] No OTP submit button — likely auto-submitted on last digit")
+    for _wrong_attempt in range(_OTP_WRONG_MAX + 1):
+        if _wrong_attempt > 0:
+            logger.warning(
+                f"[{task_id}] OTP 被判定错误/过期，准备重发并拉取新验证码 "
+                f"（第 {_wrong_attempt}/{_OTP_WRONG_MAX} 次）"
+            )
+            if log_fn:
+                log_fn(f"⚠️ 验证码错误或已过期，重新发送并获取新验证码（{_wrong_attempt}/{_OTP_WRONG_MAX}）…")
 
-    await jitter_sleep(3.0, 0.8)
+            resent = await _click_resend_button(task_id, page)
+            if not resent:
+                _otp_failure_reason = "验证码错误后未找到重发按钮"
+                logger.warning(f"[{task_id}] {_otp_failure_reason}")
+                break
+
+            await asyncio.sleep(3.0)  # allow the new email to be dispatched
+            new_code = await _poll_fresh_code(
+                task_id,
+                mail_client,
+                account["email"],
+                previous_code=code,
+                timeout=int(timeouts.get("otp_code", CODE_TIMEOUT)),
+            )
+            if not new_code:
+                _otp_failure_reason = "重发后未收到新的验证码"
+                logger.warning(f"[{task_id}] {_otp_failure_reason}")
+                break
+
+            code = new_code
+            logger.info(f"[{task_id}] 新验证码 → {code}")
+            _step(6, f"重新填写验证码 {code}")
+
+        await _fill_otp(page, code)
+        await jitter_sleep(1.0, 0.3)
+
+        submitted_otp = await click_submit_or_text(
+            page, ["Continue", "Verify", "Submit", "继续"]
+        )
+        if not submitted_otp:
+            logger.debug(f"[{task_id}] No OTP submit button — likely auto-submitted on last digit")
+
+        otp_result = await _classify_otp_submit_result(task_id, page)
+        if otp_result == "accepted":
+            _otp_ok = True
+            break
+        if otp_result == "incorrect":
+            _otp_failure_reason = "Incorrect code"
+            logger.warning(f"[{task_id}] Auth0 returned incorrect/expired OTP (attempt {_wrong_attempt + 1})")
+            continue
+
+        _otp_failure_reason = "OTP 提交后页面未前进，且未检测到明确错误提示"
+        logger.warning(f"[{task_id}] {_otp_failure_reason}")
+        break
+
+    if not _otp_ok:
+        raise RegistrationError(
+            _otp_failure_reason or f"OTP 验证失败：超过 {_OTP_WRONG_MAX + 1} 次尝试"
+        )
+
+    await jitter_sleep(1.0, 0.3)
     await _assert_not_error(task_id, page)
     logger.debug(f"[{task_id}] After OTP, URL={page.url}")
 
@@ -840,6 +912,142 @@ async def _click_resend_button(task_id: str, page: Page) -> bool:
 
     logger.debug(f"[{task_id}] 未找到重发按钮（URL={page.url}）")
     return False
+
+
+async def _is_otp_incorrect(page: Page) -> bool:
+    """
+    Return True if Auth0 is showing an "Incorrect code" / "Invalid code" error.
+
+    Auth0 renders the validation error as text near the OTP inputs, usually
+    inside an [role="alert"] / [aria-live] element or a visible <p>/<span>.
+    We do a lightweight JS text scan to avoid slow Playwright waits.
+    Returns False (i.e. "all good") if no error text is detected so the outer
+    loop can proceed normally.
+    """
+    _ERROR_KEYWORDS = [
+        "incorrect code",
+        "invalid code",
+        "wrong code",
+        "code is incorrect",
+        "code is invalid",
+        "code has expired",
+        "code expired",
+        "验证码错误",
+        "验证码无效",
+        "验证码已过期",
+        "输入的验证码不正确",
+        "code entered is incorrect",
+    ]
+
+    try:
+        visible_text: str = await page.evaluate("""
+            () => {
+                const picks = [
+                    ...document.querySelectorAll('[role="alert"]'),
+                    ...document.querySelectorAll('[aria-live]'),
+                    ...document.querySelectorAll('[class*="error"],[class*="invalid"],[class*="alert"]'),
+                    ...document.querySelectorAll('p, span, small'),
+                ];
+                return picks
+                    .filter(el => {
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    })
+                    .map(el => (el.innerText || "").toLowerCase())
+                    .join(" ");
+            }
+        """)
+        if any(kw in visible_text for kw in _ERROR_KEYWORDS):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+async def _otp_inputs_present(page: Page) -> bool:
+    """Return True if OTP input controls are still visible on the page."""
+    try:
+        count = await page.locator(_OTP_BOX_SELECTOR).count()
+        if count >= 4:
+            return True
+    except Exception:
+        pass
+
+    for sel in _OTP_SINGLE_SELECTORS:
+        try:
+            if await is_visible(page, sel):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+async def _classify_otp_submit_result(task_id: str, page: Page, timeout_ms: int = 8_000) -> str:
+    """
+    Classify the result after submitting OTP.
+
+    Returns:
+      - "accepted": page advanced away from OTP (profile page, redirect, etc.)
+      - "incorrect": explicit incorrect/invalid/expired-code message detected
+      - "pending":  still on OTP page without a decisive signal
+    """
+    deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
+
+    while asyncio.get_event_loop().time() < deadline:
+        if await _is_otp_incorrect(page):
+            return "incorrect"
+
+        url = page.url.lower()
+        on_profile_url = "about-you" in url or "about_you" in url
+        left_auth_flow = AUTH0_HOST not in url and "/auth/" not in url
+        if on_profile_url or left_auth_flow:
+            return "accepted"
+
+        # Profile inputs becoming visible is also acceptance.
+        for sel in [*_FNAME_SELECTORS, "input[name='name']", "input[name='fullName']"]:
+            try:
+                if await is_visible(page, sel):
+                    logger.debug(f"[{task_id}] OTP accepted — profile selector visible: {sel}")
+                    return "accepted"
+            except Exception:
+                pass
+
+        # If OTP inputs disappeared and no error is shown, the page likely advanced.
+        if not await _otp_inputs_present(page):
+            return "accepted"
+
+        await asyncio.sleep(0.5)
+
+    return "pending"
+
+
+async def _poll_fresh_code(
+    task_id: str,
+    mail_client: MailClient,
+    email: str,
+    *,
+    previous_code: Optional[str],
+    timeout: int,
+) -> Optional[str]:
+    """
+    Poll mail until a code different from *previous_code* arrives.
+
+    This protects flows where the provider may still expose the last OTP first.
+    Outlook's seen-ID tracking already helps, but this keeps the logic safe for
+    other MailClient implementations too.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        remaining = max(1, int(deadline - asyncio.get_event_loop().time()))
+        chunk = min(15, remaining)
+        fresh_code = await mail_client.poll_code(email, timeout=chunk)
+        if fresh_code and fresh_code != previous_code:
+            return fresh_code
+        if fresh_code == previous_code:
+            logger.debug(f"[{task_id}] 收到旧验证码 {fresh_code}，继续等待新验证码")
+        await asyncio.sleep(1.0)
+    return None
 
 
 async def _fill_otp(page: Page, code: str) -> None:
