@@ -14,6 +14,12 @@ DB_PATH = Path(__file__).parent.parent / "accounts.db"
 
 _DDL = [
     """
+    CREATE TABLE IF NOT EXISTS settings (
+        section TEXT PRIMARY KEY,
+        value   TEXT NOT NULL DEFAULT '{}'
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS accounts (
         email         TEXT PRIMARY KEY,
         password      TEXT NOT NULL DEFAULT '',

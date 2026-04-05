@@ -196,6 +196,17 @@ def db_cmd(action: str = typer.Argument("init", help="Action: init")) -> None:
         console.print(f"[red]Unknown action: {action}[/red]")
 
 
+@app.command("webui")
+def webui_cmd(
+    host: str = typer.Option("0.0.0.0", "--host", "-H", help="Bind host"),
+    port: int = typer.Option(7860, "--port",  "-p", help="Bind port"),
+) -> None:
+    """Start the WebUI server (React + FastAPI)."""
+    from src.webui.server import run
+    console.print(f"[bold green]WebUI starting → http://{'localhost' if host == '0.0.0.0' else host}:{port}[/bold green]")
+    run(host=host, port=port)
+
+
 # ── Concurrent runner ─────────────────────────────────────────────────────
 
 async def _register_async(

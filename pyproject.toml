@@ -14,6 +14,8 @@ dependencies = [
     "rich>=13.7.0",
     "pyyaml>=6.0.0",
     "aioimaplib>=2.0.1",
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
 ]
 
 [build-system]
