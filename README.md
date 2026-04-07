@@ -10,6 +10,18 @@ ChatGPT 账号无头浏览器自动批量注册工具。
 
 ---
 
+## 更新
+
+对比原版修复了：
+
+- CPA/CLIProxyAPI 连接：原版访问 localhost 类管理接口会吃系统代理，导致明明服务正常却测试失败
+- IMAP 收码：原版 Gmail/代理 IMAP 不稳定，且“邮件很快到达”时第一次轮询会把验证码当旧邮件漏掉
+- 浏览器注册流程：原版容易被 cookie 横幅、Google One Tap、Cloudflare、不同资料页形态卡住
+- 资料页填写：原版主要只兼容老的 spinbutton/下拉框，遇到单个 Birthday 文本框、Age 输入框、新版布局时会跳过或误填；现在支持 Age 页、单生日输入框、日期文本框，并且加了保护避免把年龄写进 Full name。
+- OAuth 拿 token：原版经常走到 consent / organization / callback 了却没把 token 拿回来；现在在 oauth.py 里补了组织/工作区自动选择、只点可用按钮、回调 URL 抓 code、导航事件抢 code、更稳的无等待点击，以及更长的 OAuth 超时
+- 原版 Playwright 桌面指纹存在容易引起不一致的噪声；现在在 engine.py 收紧了桌面指纹策略，减少无意义的随机变化。
+- 把 OAuth 默认超时提到 90s
+
 ## 功能特性
 
 | 功能 | 说明 |

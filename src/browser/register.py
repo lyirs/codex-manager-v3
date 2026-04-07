@@ -31,13 +31,18 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from loguru import logger
-from playwright.async_api import Page
+from playwright.async_api import Locator, Page
 
 from src.browser.engine import create_page
 from src.browser.helpers import (
     click_submit_or_text,
+    dismiss_known_obstructions,
+    fill_age_input,
+    fill_birthday_input,
     find_signup_button,
+    has_visible_birthday_controls,
     human_move_and_click,
+    is_cloudflare_challenge,
     is_error_page,
     is_visible,
     jitter_sleep,
@@ -55,6 +60,7 @@ AUTH0_HOST  = "auth.openai.com"
 MAX_RETRIES  = 5
 # Fallback timeout constants — overridden at runtime by cfg["timeouts"] values.
 CODE_TIMEOUT = 180   # seconds to poll for OTP e-mail (default; see timeouts.otp_code)
+CF_CLEARANCE_TIMEOUT = 45  # seconds to wait out Cloudflare interstitials
 
 # Transient network error substrings that should trigger a retry rather than abort.
 _NETWORK_ERRORS = (
@@ -422,6 +428,7 @@ async def _state_machine(
     # Add jitter so timing pattern is less uniform
     await jitter_sleep(2.0, 0.5)
     await _assert_not_error(task_id, page)
+    await dismiss_known_obstructions(task_id, page)
     logger.debug(f"[{task_id}] GOTO_SIGNUP landed: {page.url}")
 
     # ── tool.js GOTO_SIGNUP: check if email input already visible ────
@@ -446,6 +453,7 @@ async def _state_machine(
         if signup_btn:
             logger.info(f"[{task_id}] Clicking Sign Up button (human simulation)")
             # Use human-like mouse movement before click — Auth0 detects direct clicks
+            await dismiss_known_obstructions(task_id, page)
             await human_move_and_click(page, signup_btn)
 
             # tool.js: await _0x1ae(0xbb8) — 3 s after clicking signup
@@ -461,11 +469,14 @@ async def _state_machine(
     # tool.js: _0x1bf(email_selectors, 0x3a98) — wait up to 15 s
     _step(3, f"填写邮箱 {account['email']}")
     logger.info(f"[{task_id}] FILL_EMAIL — URL={page.url}")
-    email_result = await wait_any_element(
-        page, _EMAIL_SELECTORS,
+    email_result = await _wait_any_element_with_cf(
+        task_id,
+        page,
+        _EMAIL_SELECTORS,
         timeout_ms=int(timeouts.get("email_input", 15) * 1000),
     )
     if not email_result:
+        await _assert_not_error(task_id, page)
         try:
             snippet = (await page.content())[:600]
             logger.debug(f"[{task_id}] Page snippet:\n{snippet}")
@@ -493,6 +504,7 @@ async def _state_machine(
         pass
 
     if sub_loc:
+        await dismiss_known_obstructions(task_id, page)
         await human_move_and_click(page, sub_loc)
         submitted = True
     else:
@@ -514,7 +526,9 @@ async def _state_machine(
     logger.info(f"[{task_id}] FILL_PASSWORD — waiting for password or OTP (≤{timeouts.get('password_input', 60)} s)")
 
     detected = await _wait_for_password_or_otp(
-        page, timeout_ms=int(timeouts.get("password_input", 60) * 1000),
+        task_id,
+        page,
+        timeout_ms=int(timeouts.get("password_input", 60) * 1000),
     )
 
     if detected == "already_registered":
@@ -540,10 +554,14 @@ async def _state_machine(
 
     if not skip_pw_to_otp:
         # detected == "password"
-        pw_result = await wait_any_element(
-            page, _PASSWORD_SELECTORS, timeout_ms=3000,
+        pw_result = await _wait_any_element_with_cf(
+            task_id,
+            page,
+            _PASSWORD_SELECTORS,
+            timeout_ms=3000,
         )
         if not pw_result:
+            await _assert_not_error(task_id, page)
             raise RegistrationError(f"Password input not found (post-detect). URL={page.url}")
         await _assert_not_error(task_id, page)
 
@@ -568,6 +586,7 @@ async def _state_machine(
             pass
 
         if pw_sub_loc:
+            await dismiss_known_obstructions(task_id, page)
             await human_move_and_click(page, pw_sub_loc)
             submitted_pw = True
         else:
@@ -591,7 +610,9 @@ async def _state_machine(
     else:
         logger.info(f"[{task_id}] WAIT_CODE — waiting for OTP inputs (≤{timeouts.get('otp_input', 60)} s)")
         otp_appeared = await _wait_for_otp_inputs(
-            page, timeout_ms=int(timeouts.get("otp_input", 60) * 1000),
+            task_id,
+            page,
+            timeout_ms=int(timeouts.get("otp_input", 60) * 1000),
         )
         if not otp_appeared:
             raise RegistrationError(
@@ -757,7 +778,7 @@ async def _state_machine(
 
 # ── Sub-routines ───────────────────────────────────────────────────────────
 
-async def _wait_for_password_or_otp(page: Page, timeout_ms: int = 60_000) -> str:
+async def _wait_for_password_or_otp(task_id: str, page: Page, timeout_ms: int = 60_000) -> str:
     """
     After email submit, race between password input and OTP input.
 
@@ -816,6 +837,15 @@ async def _wait_for_password_or_otp(page: Page, timeout_ms: int = 60_000) -> str
         if any(kw in url for kw in ("magic", "email-link", "email-verify", "check-email")):
             return "otp"
 
+        if await is_cloudflare_challenge(page):
+            remaining_ms = max(1_000, int((deadline - asyncio.get_event_loop().time()) * 1000))
+            await _wait_for_cloudflare_clearance(
+                task_id,
+                page,
+                timeout_ms=min(CF_CLEARANCE_TIMEOUT * 1000, remaining_ms),
+            )
+            continue
+
         await asyncio.sleep(0.5)
 
     return "none"
@@ -827,6 +857,7 @@ async def _assert_not_error(task_id: str, page: Page) -> None:
       • URL contains /api/auth/error
       • body text contains '糟糕', '出错了', 'Operation timed out', '操作超时'
     """
+    await _wait_for_cloudflare_clearance(task_id, page)
     if "/api/auth/error" in page.url:
         raise RegistrationError(
             f"NextAuth error page — bot-detected or OAuth config issue: {page.url}"
@@ -852,7 +883,86 @@ async def _find_visible_email_input(page: Page) -> bool:
     return False
 
 
-async def _wait_for_otp_inputs(page: Page, timeout_ms: int = 60_000) -> bool:
+async def _wait_for_cloudflare_clearance(
+    task_id: str,
+    page: Page,
+    *,
+    timeout_ms: int = CF_CLEARANCE_TIMEOUT * 1000,
+) -> bool:
+    """
+    If Cloudflare interstitial is present, wait for it to clear.
+
+    Returns True when a challenge was observed and later cleared.
+    Returns False when no challenge was seen at all.
+    Raises RegistrationError when the challenge persists past timeout.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout_ms / 1000
+    saw_challenge = False
+
+    while loop.time() < deadline:
+        if await is_cloudflare_challenge(page):
+            if not saw_challenge:
+                saw_challenge = True
+                logger.warning(
+                    f"[{task_id}] Cloudflare challenge detected; waiting up to "
+                    f"{max(timeout_ms / 1000, 1):.0f}s for clearance. URL={page.url}"
+                )
+            await asyncio.sleep(1.0)
+            continue
+
+        if saw_challenge:
+            await jitter_sleep(1.5, 0.2)
+            if await is_cloudflare_challenge(page):
+                await asyncio.sleep(0.5)
+                continue
+            logger.info(f"[{task_id}] Cloudflare challenge cleared -> {page.url}")
+            return True
+
+        return False
+
+    if saw_challenge:
+        raise RegistrationError(
+            f"Cloudflare challenge did not clear within {timeout_ms // 1000}s. URL={page.url}"
+        )
+    return False
+
+
+async def _wait_any_element_with_cf(
+    task_id: str,
+    page: Page,
+    selectors: list[str],
+    *,
+    timeout_ms: int,
+) -> Optional[tuple[str, Locator]]:
+    """
+    Wait for one of *selectors* while tolerating a transient Cloudflare page.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout_ms / 1000
+
+    while loop.time() < deadline:
+        remaining_ms = max(500, int((deadline - loop.time()) * 1000))
+        result = await wait_any_element(
+            page,
+            selectors,
+            timeout_ms=min(1_500, remaining_ms),
+        )
+        if result:
+            return result
+
+        if await is_cloudflare_challenge(page):
+            await _wait_for_cloudflare_clearance(
+                task_id,
+                page,
+                timeout_ms=min(CF_CLEARANCE_TIMEOUT * 1000, remaining_ms),
+            )
+            continue
+
+    return None
+
+
+async def _wait_for_otp_inputs(task_id: str, page: Page, timeout_ms: int = 60_000) -> bool:
     """
     Wait for OTP input elements to appear.
     Mirrors tool.js _0x98d inner loop:
@@ -873,6 +983,14 @@ async def _wait_for_otp_inputs(page: Page, timeout_ms: int = 60_000) -> bool:
         for sel in _OTP_SINGLE_SELECTORS:
             if await is_visible(page, sel):
                 return True
+        if await is_cloudflare_challenge(page):
+            remaining_ms = max(1_000, int((deadline - asyncio.get_event_loop().time()) * 1000))
+            await _wait_for_cloudflare_clearance(
+                task_id,
+                page,
+                timeout_ms=min(CF_CLEARANCE_TIMEOUT * 1000, remaining_ms),
+            )
+            continue
         await asyncio.sleep(1.0)
     return False
 
@@ -1104,6 +1222,11 @@ async def _fill_profile(task_id: str, page: Page, account: dict, timeouts: dict)
     _pf_ms = int(timeouts.get("profile_field", 5) * 1000)
     full_name = f"{account['firstName']} {account['lastName']}"
     date_str  = f"{bd['year']}-{bd['month']:02d}-{bd['day']:02d}"
+    today = datetime.now()
+    age = today.year - bd["year"]
+    if (today.month, today.day) < (bd["month"], bd["day"]):
+        age -= 1
+    age = max(age, 1)
 
     # ── Step 1: Fill name field(s) ────────────────────────────────────────────
     fname_result = await wait_any_element(page, _FNAME_SELECTORS, timeout_ms=_pf_ms)
@@ -1151,6 +1274,24 @@ async def _fill_profile(task_id: str, page: Page, account: dict, timeouts: dict)
 
     # Wait for conditional age/date inputs to appear after name is filled
     await asyncio.sleep(1.5)
+
+    # Some newer about-you variants ask only for integer age, not full birthday.
+    age_fill = None
+    birthday_controls_present = await has_visible_birthday_controls(
+        page,
+        timeout_ms=max(800, min(_pf_ms, 1_500)),
+    )
+    if birthday_controls_present:
+        logger.debug(f"[{task_id}] Birthday controls detected — skipping age-only fallback")
+    else:
+        age_fill = await fill_age_input(
+            page,
+            age=age,
+            timeout_ms=max(2_500, _pf_ms),
+        )
+        if age_fill:
+            logger.info(f"[{task_id}] Age filled via input {age_fill}")
+            await asyncio.sleep(0.4)
 
     # ── Step 2: Fill birthday spinbuttons (label-aware, mirrors oauth.py) ─────
     try:
@@ -1244,15 +1385,17 @@ async def _fill_profile(task_id: str, page: Page, account: dict, timeouts: dict)
             if select_filled and select_filled > 0:
                 logger.info(f"[{task_id}] Birthday filled via {select_filled} <select> dropdown(s)")
             else:
-                # Fall back to date input
-                date_found = False
-                for sel in ["input[type='date']", "input[name*='birth']", "input[id*='birth']"]:
-                    if await is_visible(page, sel):
-                        await set_react_input(page, sel, date_str)
-                        logger.info(f"[{task_id}] Birthday via date selector {sel!r}: {date_str}")
-                        date_found = True
-                        break
-                if not date_found:
+                # Fall back to a single birthday/date input (native or masked text input).
+                birthday_fill = await fill_birthday_input(
+                    page,
+                    year=bd["year"],
+                    month=bd["month"],
+                    day=bd["day"],
+                    timeout_ms=max(2_500, _pf_ms),
+                )
+                if birthday_fill:
+                    logger.info(f"[{task_id}] Birthday filled via input {birthday_fill}")
+                elif not age_fill:
                     logger.warning(
                         f"[{task_id}] Birthday input not found — skipping "
                         f"(selects_filled={select_filled})"

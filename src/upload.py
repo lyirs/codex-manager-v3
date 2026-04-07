@@ -29,6 +29,12 @@ DEFAULT_NEWAPI_MODELS = (
 )
 
 
+def _http_client(timeout: int) -> httpx.AsyncClient:
+    # These requests target user-configured management endpoints directly.
+    # Avoid ambient system proxy settings so localhost/SSH-tunnel URLs behave predictably.
+    return httpx.AsyncClient(timeout=timeout, trust_env=False)
+
+
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 async def _load_accounts_by_emails(emails: List[str]) -> List[dict]:
@@ -171,7 +177,7 @@ async def batch_upload_newapi(
         "Content-Type": "application/json; charset=utf-8",
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with _http_client(timeout=30) as client:
         for acc in accounts:
             if not acc.get("access_token"):
                 _skip(results, acc["email"], "缺少 access_token")
@@ -273,7 +279,7 @@ async def batch_upload_cpa(
     results = _result_set()
     upload_url = _normalize_cpa_url(api_url)
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with _http_client(timeout=30) as client:
         for acc in accounts:
             if not acc.get("access_token"):
                 _skip(results, acc["email"], "缺少 access_token")
@@ -298,7 +304,7 @@ async def test_cpa_connection(api_url: str, api_token: str) -> Tuple[bool, str]:
         503: (False, "连接成功，但服务端认证管理器不可用"),
     }
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with _http_client(timeout=10) as client:
             resp = await client.get(test_url, headers=headers)
         ok, msg = STATUS_MESSAGES.get(resp.status_code, (False, f"异常状态码: {resp.status_code}"))
         return ok, msg
@@ -407,7 +413,7 @@ async def batch_upload_sub2api(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with _http_client(timeout=30) as client:
             resp = await client.post(url, headers=headers, json=payload)
         if resp.status_code in (200, 201):
             for email in valid_emails:
@@ -428,7 +434,7 @@ async def test_sub2api_connection(api_url: str, api_key: str) -> Tuple[bool, str
     url = api_url.rstrip("/") + "/api/v1/admin/accounts/data"
     headers = {"x-api-key": api_key}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with _http_client(timeout=10) as client:
             resp = await client.get(url, headers=headers)
         if resp.status_code in (200, 201, 204, 405):
             return True, "Sub2API 连接测试成功"
@@ -449,7 +455,7 @@ async def test_newapi_connection(api_url: str, api_key: str) -> Tuple[bool, str]
     url = api_url.rstrip("/") + "/api/channel/"
     headers = {"Authorization": f"Bearer {api_key}", "New-Api-User": "1"}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with _http_client(timeout=10) as client:
             resp = await client.get(url, headers=headers)
         if resp.status_code in (200, 201):
             return True, "NewAPI 连接测试成功"

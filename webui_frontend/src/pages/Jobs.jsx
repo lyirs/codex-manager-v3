@@ -106,6 +106,16 @@ export function Jobs() {
   }, [])
 
   useEffect(() => {
+    api.getConfig().then(cfg => {
+      setForm(f => ({
+        ...f,
+        engine: cfg?.engine || f.engine,
+        provider: cfg?.mail_provider || f.provider,
+      }))
+    }).catch(() => {})
+  }, [])
+
+  useEffect(() => {
     if (!selected) { setDetail(null); return }
     const poll = () => api.getJob(selected).then(d => { setDetail(d); if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight }).catch(() => {})
     poll()

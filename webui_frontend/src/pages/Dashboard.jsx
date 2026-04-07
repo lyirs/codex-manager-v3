@@ -78,6 +78,16 @@ export function Dashboard() {
     return () => clearInterval(id)
   }, [])
 
+  useEffect(() => {
+    api.getConfig().then(cfg => {
+      setForm(f => ({
+        ...f,
+        engine: cfg?.engine || f.engine,
+        provider: cfg?.mail_provider || f.provider,
+      }))
+    }).catch(() => {})
+  }, [])
+
   const success  = stats?.['注册完成'] ?? 0
   const total    = stats?.total ?? 0
   const rate     = total ? Math.round((success / total) * 100) : 0

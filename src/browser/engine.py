@@ -44,8 +44,7 @@ _VIEWPORTS = [
 _CHROMIUM_UAS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
 ]
 
 _TIMEZONES = [
@@ -414,7 +413,10 @@ async def create_page(
     """
     proxy_cfg = _parse_proxy(proxy) if proxy else None
     viewport  = random.choice(_VIEWPORTS)
-    timezone  = random.choice(_TIMEZONES)
+    # For Playwright desktop sessions, prefer the browser/runtime default
+    # timezone instead of re-randomizing each launch. Random timezone churn
+    # across retries creates an easy fingerprint inconsistency.
+    timezone: Optional[str] = None
 
     mode_label = "headless" if headless else "HEADED"
     mobile_label = " [MOBILE]" if mobile else ""
@@ -660,7 +662,14 @@ async def _camoufox_page(proxy_cfg, viewport, headless: bool, slow_mo: int, mobi
 
 
 @asynccontextmanager
-async def _playwright_page(proxy_cfg, viewport, timezone, headless: bool, slow_mo: int, mobile: bool = False):
+async def _playwright_page(
+    proxy_cfg,
+    viewport,
+    timezone: Optional[str],
+    headless: bool,
+    slow_mo: int,
+    mobile: bool = False,
+):
     """Launch a Chromium page via playwright with stealth patches.
 
     Mobile mode: uses a random iOS/Android User-Agent, a portrait mobile viewport
@@ -706,14 +715,16 @@ async def _playwright_page(proxy_cfg, viewport, timezone, headless: bool, slow_m
             proxy=proxy_cfg,
             args=launch_args,
         )
-        context = await browser.new_context(
-            user_agent=ua,
-            viewport=vp,
-            locale="en-US",
-            timezone_id=timezone,
-            java_script_enabled=True,
+        context_kwargs = {
+            "user_agent": ua,
+            "viewport": vp,
+            "locale": "en-US",
+            "java_script_enabled": True,
             **ctx_extra,
-        )
+        }
+        if timezone:
+            context_kwargs["timezone_id"] = timezone
+        context = await browser.new_context(**context_kwargs)
         await context.add_init_script(stealth_js)
         page = await context.new_page()
         try:

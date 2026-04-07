@@ -33,7 +33,9 @@ from loguru import logger
 from playwright.async_api import Page
 
 from src.browser.helpers import (
-    human_move_and_click,
+    fill_age_input,
+    fill_birthday_input,
+    has_visible_birthday_controls,
     wait_any_element,
     set_react_input,
     click_submit_or_text,
@@ -51,23 +53,232 @@ OAUTH_SCOPE        = "openid profile email offline_access"
 #   terms agreement (Accept/Agree), etc.
 # Priority: explicit Allow/Authorize first; generic Continue/Submit last.
 _FLOW_SELECTORS: list[str] = [
-    "button:has-text('Allow')",
-    "button:has-text('Authorize')",
+    "button:has-text('Allow'):not([disabled]):not([aria-disabled='true'])",
+    "button:has-text('Authorize'):not([disabled]):not([aria-disabled='true'])",
     "button[data-testid='allow-button']",
     "button[data-testid='consent-allow']",
     "button[data-action='allow']",
-    "input[type='submit'][value*='Allow' i]",
-    "input[type='submit'][value*='Authorize' i]",
+    "input[type='submit'][value*='Allow' i]:not([disabled])",
+    "input[type='submit'][value*='Authorize' i]:not([disabled])",
     # Intermediate OAuth pages (about-you, workspace, org, age-verification, terms)
-    "button:has-text('Continue')",
-    "button:has-text('Accept')",
-    "button:has-text('Agree')",
-    "button:has-text('Next')",
-    "button[type='submit']:not([disabled])",
+    "button:has-text('Continue'):not([disabled]):not([aria-disabled='true'])",
+    "button:has-text('Accept'):not([disabled]):not([aria-disabled='true'])",
+    "button:has-text('Agree'):not([disabled]):not([aria-disabled='true'])",
+    "button:has-text('Next'):not([disabled]):not([aria-disabled='true'])",
+    "[role='button']:has-text('Continue'):not([aria-disabled='true'])",
+    "[role='button']:has-text('Accept'):not([aria-disabled='true'])",
+    "[role='button']:has-text('Agree'):not([aria-disabled='true'])",
+    "[role='button']:has-text('Next'):not([aria-disabled='true'])",
+    "button[type='submit']:not([disabled]):not([aria-disabled='true'])",
+    "input[type='submit']:not([disabled])",
 ]
 
 # Keep the old name for backwards compatibility (used in unit tests / imports)
 _CONSENT_SELECTORS = _FLOW_SELECTORS
+
+_OAUTH_REDIRECT_PATTERNS = [
+    "http://localhost:1455/**",
+    "http://127.0.0.1:1455/**",
+]
+
+
+async def _oauth_debug_interactives(page: Page) -> dict:
+    """Return a compact snapshot of visible OAuth controls for logging."""
+    try:
+        return await page.evaluate(
+            """
+            () => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const clean = (text) => (text || '').replace(/\\s+/g, ' ').trim();
+                const buttons = Array.from(
+                    document.querySelectorAll(
+                        'button, [role="button"], a, input[type="submit"], input[type="button"]'
+                    )
+                )
+                    .filter(visible)
+                    .slice(0, 12)
+                    .map((el) => ({
+                        tag: el.tagName.toLowerCase(),
+                        text: clean(el.innerText || el.value || el.getAttribute('aria-label') || ''),
+                        disabled: !!el.disabled,
+                        ariaDisabled: el.getAttribute('aria-disabled') || '',
+                        type: el.getAttribute('type') || '',
+                    }));
+                const options = Array.from(
+                    document.querySelectorAll(
+                        'input[type="radio"], [role="radio"], [role="option"], [data-testid*="organization" i], [data-testid*="workspace" i]'
+                    )
+                )
+                    .filter(visible)
+                    .slice(0, 12)
+                    .map((el) => ({
+                        tag: el.tagName.toLowerCase(),
+                        text: clean(el.innerText || el.getAttribute('aria-label') || el.value || ''),
+                        checked: !!el.checked,
+                        ariaChecked: el.getAttribute('aria-checked') || '',
+                        ariaSelected: el.getAttribute('aria-selected') || '',
+                        disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+                    }));
+                const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
+                    .filter(visible)
+                    .slice(0, 6)
+                    .map((el) => clean(el.innerText));
+                return { headings, buttons, options };
+            }
+            """
+        )
+    except Exception as exc:
+        return {"error": str(exc), "url": page.url}
+
+
+async def _oauth_try_select_scope(page: Page) -> Optional[str]:
+    """
+    On organization/workspace chooser pages, select the first visible option so
+    the Continue button becomes enabled.
+    """
+    try:
+        result = await page.evaluate(
+            """
+            () => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const clean = (text) => (text || '').replace(/\\s+/g, ' ').trim();
+                const isSelected = (el) => {
+                    const state = (el.getAttribute('data-state') || '').toLowerCase();
+                    return !!el.checked ||
+                        el.getAttribute('aria-checked') === 'true' ||
+                        el.getAttribute('aria-selected') === 'true' ||
+                        state === 'checked' || state === 'selected' || state === 'active';
+                };
+                const isDisabled = (el) =>
+                    !!el.disabled || el.getAttribute('aria-disabled') === 'true';
+                const clickEl = (el) => {
+                    if (!el) return false;
+                    el.scrollIntoView({ block: 'center', inline: 'center' });
+                    el.click();
+                    return true;
+                };
+
+                const radios = Array.from(document.querySelectorAll('input[type="radio"]')).filter(visible);
+                for (const el of radios) {
+                    if (isDisabled(el) || isSelected(el)) continue;
+                    const label = el.labels && el.labels.length ? el.labels[0] : null;
+                    if (clickEl(label || el)) {
+                        return clean((label && label.innerText) || el.value || el.getAttribute('aria-label') || 'radio');
+                    }
+                }
+
+                const ariaRadios = Array.from(document.querySelectorAll('[role="radio"], [role="option"]')).filter(visible);
+                for (const el of ariaRadios) {
+                    if (isDisabled(el) || isSelected(el)) continue;
+                    if (clickEl(el)) {
+                        return clean(el.innerText || el.getAttribute('aria-label') || el.id || 'role-option');
+                    }
+                }
+
+                const actionWords = /(continue|allow|authorize|agree|accept|back|cancel|skip|next)/i;
+                const hinted = Array.from(document.querySelectorAll('button, label, div, li')).filter((el) => {
+                    if (!visible(el) || isDisabled(el) || isSelected(el)) return false;
+                    const text = clean(el.innerText || '');
+                    const attrs = clean([
+                        el.id || '',
+                        el.className || '',
+                        el.getAttribute('data-testid') || '',
+                        el.getAttribute('aria-label') || '',
+                    ].join(' '));
+                    if (!text && !attrs) return false;
+                    if (actionWords.test(text)) return false;
+                    return /(organization|workspace|team|personal)/i.test(`${text} ${attrs}`);
+                });
+                for (const el of hinted) {
+                    if (clickEl(el)) {
+                        return clean(el.innerText || el.getAttribute('aria-label') || el.id || 'hinted-option');
+                    }
+                }
+                return null;
+            }
+            """
+        )
+    except Exception as exc:
+        logger.debug(f"[oauth] Scope auto-select evaluate failed: {exc}")
+        return None
+    if result:
+        logger.info(f"[oauth] Selected organization/workspace option: {result!r}")
+        await asyncio.sleep(0.8)
+    return result
+
+
+async def _oauth_find_flow_action(page: Page, timeout_ms: int):
+    """
+    Find the first visible, enabled OAuth action button. If the page is waiting
+    for an organization/workspace choice, try selecting one first.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_ms / 1000
+    scope_tried = False
+
+    while loop.time() < deadline:
+        for sel in _FLOW_SELECTORS:
+            try:
+                loc = page.locator(sel).first
+                if await loc.is_visible():
+                    disabled = await loc.get_attribute("disabled")
+                    aria_disabled = await loc.get_attribute("aria-disabled")
+                    if disabled is None and aria_disabled != "true":
+                        return sel, loc
+            except Exception:
+                pass
+
+        cur_url = page.url.lower()
+        if (("organization" in cur_url or "workspace" in cur_url) and not scope_tried):
+            scope_tried = True
+            if await _oauth_try_select_scope(page):
+                continue
+
+        await asyncio.sleep(0.35)
+
+    return None
+
+
+async def _oauth_click_action(page: Page, locator) -> None:
+    """
+    Click an OAuth consent/workspace action without waiting on post-click
+    navigation. Human-like mouse movement is intentionally skipped here because
+    these pages often redirect immediately to localhost and Playwright can get
+    stuck waiting on the old locator.
+    """
+    try:
+        await locator.scroll_into_view_if_needed()
+    except Exception:
+        pass
+
+    try:
+        await locator.click(no_wait_after=True, timeout=2_500)
+        return
+    except Exception as exc:
+        logger.debug(f"[oauth] Direct no-wait click failed: {exc}")
+
+    try:
+        box = await asyncio.wait_for(locator.bounding_box(), timeout=2.0)
+        if box:
+            x = box["x"] + box["width"] * 0.5
+            y = box["y"] + box["height"] * 0.5
+            await page.mouse.click(x, y)
+            return
+    except Exception as exc:
+        logger.debug(f"[oauth] Mouse-click path failed: {exc}")
+    raise RuntimeError("OAuth action click failed")
 
 
 # ── Token result model ───────────────────────────────────────────────────────
@@ -160,7 +371,7 @@ async def acquire_tokens_via_browser(
     last_name: str = "",
     birthday: Optional[dict] = None,
     proxy: Optional[str] = None,
-    timeout: float = 45.0,
+    timeout: float = 90.0,
     timeouts: Optional[dict] = None,
     mail_client: Optional[MailClient] = None,
     mobile: bool = False,
@@ -244,7 +455,27 @@ async def acquire_tokens_via_browser(
             except Exception:
                 pass
 
-        await oauth_page.route("http://localhost:1455/**", _intercept)
+        oauth_context = oauth_page.context
+        for pattern in _OAUTH_REDIRECT_PATTERNS:
+            await oauth_context.route(pattern, _intercept)
+
+        def _on_frame_navigated(frame) -> None:
+            try:
+                if frame != oauth_page.main_frame:
+                    return
+                cur = frame.url or ""
+                if "code=" not in cur:
+                    return
+                if "localhost:1455" not in cur and OAUTH_REDIRECT_URI.split("?")[0] not in cur:
+                    return
+                code = _extract_code(cur)
+                if code and code not in captured:
+                    captured.append(code)
+                    logger.info(f"[oauth] Code captured from navigation event: {cur[:120]}")
+            except Exception:
+                pass
+
+        oauth_page.on("framenavigated", _on_frame_navigated)
 
         async def _run_flow() -> Optional[TokenResult]:
             # ── URL-based code extractor (route-handler bypass guard) ────────
@@ -405,28 +636,31 @@ async def acquire_tokens_via_browser(
                     await _fill_about_you_js(oauth_page, fn, ln, bd)
                     await asyncio.sleep(1.5)
 
-                element = await wait_any_element(
-                    oauth_page, _FLOW_SELECTORS,
+                element = await _oauth_find_flow_action(
+                    oauth_page,
                     timeout_ms=int(_to.get("oauth_flow_element", 8) * 1000),
                 )
                 if not element:
+                    dbg = await _oauth_debug_interactives(oauth_page)
                     logger.warning(
                         f"[oauth] No elements found for click-through "
                         f"(try {attempt}) at {oauth_page.url}"
                     )
+                    logger.debug(f"[oauth] Flow page snapshot: {dbg}")
                     continue
 
                 matched_sel, btn = element
                 logger.info(f"[oauth] Clicking flow button (sel={matched_sel!r}) at {oauth_page.url}")
-                await human_move_and_click(oauth_page, btn)
+                await _oauth_click_action(oauth_page, btn)
 
-                await asyncio.sleep(3.0)
-                _sync_capture_from_url()
-                if captured:
-                    logger.info(f"[oauth] Code captured (len={len(captured[0])}) — exchanging for tokens")
-                    if log_fn:
-                        log_fn("[OAuth] 授权码已获取，正在交换令牌…")
-                    return await _exchange_code(captured[0], verifier, email, proxy, _to)
+                for _ in range(20):
+                    await asyncio.sleep(0.2)
+                    _sync_capture_from_url()
+                    if captured:
+                        logger.info(f"[oauth] Code captured (len={len(captured[0])}) — exchanging for tokens")
+                        if log_fn:
+                            log_fn("[OAuth] 授权码已获取，正在交换令牌…")
+                        return await _exchange_code(captured[0], verifier, email, proxy, _to)
 
             # ── Final fallback: code may have been captured during the loop ──
             await asyncio.sleep(0.5)
@@ -452,9 +686,14 @@ async def acquire_tokens_via_browser(
             return None
         finally:
             try:
-                await oauth_page.unroute("http://localhost:1455/**")
+                oauth_page.remove_listener("framenavigated", _on_frame_navigated)
             except Exception:
                 pass
+            for pattern in _OAUTH_REDIRECT_PATTERNS:
+                try:
+                    await oauth_context.unroute(pattern)
+                except Exception:
+                    pass
 
 
 
@@ -779,8 +1018,11 @@ async def _fill_about_you_js(
         age -= 1
     age_str = _json.dumps(str(max(age, 1)))
 
-    date_str = _json.dumps(
-        f"{bd['year']}/{str(bd['month']).zfill(2)}/{str(bd['day']).zfill(2)}"
+    date_iso_str = _json.dumps(
+        f"{bd['year']}-{str(bd['month']).zfill(2)}-{str(bd['day']).zfill(2)}"
+    )
+    date_us_str = _json.dumps(
+        f"{str(bd['month']).zfill(2)}/{str(bd['day']).zfill(2)}/{bd['year']}"
     )
 
     # ── Step 1: Fill visible non-control inputs (name + optionally age) ──
@@ -801,12 +1043,21 @@ async def _fill_about_you_js(
                 el.dispatchEvent(new Event('change', {{bubbles: true}}));
                 el.dispatchEvent(new Event('blur',   {{bubbles: true}}));
             }};
-            if (inputs.length > 0) fire(inputs[0], {full_name});
-            if (inputs.length > 1) {{
-                // If second input is a number type it is the age field — fill with integer age.
-                // Otherwise fall back to date string for date-type inputs.
-                const val = inputs[1].type === 'number' ? {age_str} : {date_str};
-                fire(inputs[1], val);
+            const hint = (el) => (
+                (el.name || '') + ' ' + (el.id || '') + ' ' +
+                (el.getAttribute('aria-label') || '') + ' ' +
+                (el.getAttribute('placeholder') || '')
+            ).toLowerCase();
+            const nameInput = inputs.find(el => {{
+                const h = hint(el);
+                return el.name === 'name' || el.name === 'fullName' ||
+                    h.includes('full name') || (h.includes('name') && !h.includes('birth'));
+            }}) || inputs[0];
+            if (nameInput) fire(nameInput, {full_name});
+            const auxInput = inputs.find(el => el !== nameInput && (el.type === 'number' || el.type === 'date'));
+            if (auxInput) {{
+                const val = auxInput.type === 'number' ? {age_str} : {date_iso_str};
+                fire(auxInput, val);
             }}
             return inputs.map(el => ({{type: el.type, name: el.name, id: el.id}}));
         }}
@@ -836,15 +1087,24 @@ async def _fill_about_you_js(
             }};
             let filled = [];
             for (const el of inputs) {{
-                if (el.name === 'name' || el.type === 'text') {{
+                const hint = (
+                    (el.name || '') + ' ' + (el.id || '') + ' ' +
+                    (el.getAttribute('aria-label') || '') + ' ' +
+                    (el.getAttribute('placeholder') || '')
+                ).toLowerCase();
+                if (el.name === 'name' || el.name === 'fullName' ||
+                    hint.includes('full name') || (hint.includes('name') && !hint.includes('birth'))) {{
                     if (!el.value) fire(el, {full_name});
                     filled.push('name:' + el.value.substring(0, 10));
-                }} else if (el.type === 'number') {{
+                }} else if (el.type === 'number' || hint.includes('age')) {{
                     fire(el, {age_str});
                     filled.push('age:' + {age_str});
                 }} else if (el.type === 'date') {{
-                    fire(el, {date_str});
-                    filled.push('date:' + {date_str});
+                    fire(el, {date_iso_str});
+                    filled.push('date:' + {date_iso_str});
+                }} else if (hint.includes('birth') || hint.includes('birthday') || hint.includes('dob')) {{
+                    fire(el, {date_us_str});
+                    filled.push('birth:' + {date_us_str});
                 }}
             }}
             return filled;
@@ -852,6 +1112,15 @@ async def _fill_about_you_js(
     """)
     if result2:
         logger.debug(f"[oauth] About-you re-scan fill result: {result2}")
+
+    age_fill = None
+    birthday_controls_present = await has_visible_birthday_controls(page, timeout_ms=1_200)
+    if birthday_controls_present:
+        logger.debug("[oauth] Birthday controls detected — skipping age-only fallback")
+    else:
+        age_fill = await fill_age_input(page, age=max(age, 1), timeout_ms=3_000)
+        if age_fill:
+            logger.debug(f"[oauth] Age filled via input {age_fill}")
 
     # ── Step 4: Fill birthday spinbuttons ─────────────────────────────────
     # Use page.evaluate() for one-shot detection — avoids locator.evaluate() 30 s
@@ -890,7 +1159,20 @@ async def _fill_about_you_js(
                 await fill_spinbutton(page, i, val)
                 logger.debug(f"[oauth] sb[{i}] {field}={val} done")
         else:
-            logger.debug(f"[oauth] Only {len(sb_info) if sb_info else 0} spinbuttons found — skipping date fill")
+            birthday_fill = await fill_birthday_input(
+                page,
+                year=bd["year"],
+                month=bd["month"],
+                day=bd["day"],
+                timeout_ms=3_000,
+            )
+            if birthday_fill:
+                logger.debug(f"[oauth] Birthday filled via input {birthday_fill}")
+            elif not age_fill:
+                logger.debug(
+                    f"[oauth] Only {len(sb_info) if sb_info else 0} spinbuttons found — "
+                    "no birthday input matched"
+                )
     except Exception as _e:
         logger.debug(f"[oauth] Spinbutton fill skipped: {_e}")
 

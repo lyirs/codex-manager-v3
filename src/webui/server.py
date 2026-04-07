@@ -148,6 +148,7 @@ async def _run_job(job: _Job) -> None:
                     use_alias    = prov.get("use_alias"),
                     auth_type    = auth_type,
                     access_token = cred if auth_type == "oauth2" else "",
+                    proxy        = proxy,
                 )
             elif _is_outlook:
                 if not out_raw:

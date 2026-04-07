@@ -1,0 +1,18 @@
+# Python virtualenv and caches
+.venv/
+**/__pycache__/
+*.py[cod]
+
+# Local runtime data
+accounts.db
+register.log
+webui_stdout.log
+webui_stderr.log
+
+# Frontend build output
+src/webui/static/
+
+# Optional local-only files
+.env
+.env.*
+proxies.local.txt

@@ -1177,7 +1177,7 @@ function TabAdvanced() {
           <Toggle checked={!!oauth.enabled} onChange={v => setOauth(d => ({ ...d, enabled: v }))} />
         </Field>
         <Field label="OAuth 超时 (秒)">
-          <Input type="number" min={10} max={300} value={oauth.timeout ?? 45} onChange={e => setOauth(d => ({ ...d, timeout: +e.target.value }))} />
+          <Input type="number" min={10} max={300} value={oauth.timeout ?? 90} onChange={e => setOauth(d => ({ ...d, timeout: +e.target.value }))} />
         </Field>
       </Section>
       <Section title="注册配置">

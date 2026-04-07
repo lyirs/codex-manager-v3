@@ -51,7 +51,7 @@ _DEFAULTS: dict[str, Any] = {
     "registration": {"prefix": "", "domain": ""},
     "team": {"url": "", "key": ""},
     "sync": {"url": "", "key": ""},
-    "oauth": {"enabled": True, "timeout": 45},
+    "oauth": {"enabled": True, "timeout": 90},
     "mouse": {
         "human_simulation": True,
         "steps_min":        4,
@@ -76,7 +76,7 @@ _DEFAULTS: dict[str, Any] = {
         "oauth_login_email":    8,
         "oauth_login_password": 10,
         "oauth_token_exchange": 30,
-        "oauth_total":          45,
+        "oauth_total":          90,
     },
     "timing": {
         "post_nav":      1.0,
@@ -178,7 +178,7 @@ async def build_config() -> dict[str, Any]:
     oauth_db = copy.deepcopy(db.get("oauth", _DEFAULTS["oauth"]))
     cfg["oauth"] = oauth_db
     cfg["enable_oauth"] = oauth_db.get("enabled", True)
-    cfg["timeouts"]["oauth_total"] = oauth_db.get("timeout", cfg["timeouts"].get("oauth_total", 45))
+    cfg["timeouts"]["oauth_total"] = oauth_db.get("timeout", cfg["timeouts"].get("oauth_total", 90))
 
     return cfg
 
