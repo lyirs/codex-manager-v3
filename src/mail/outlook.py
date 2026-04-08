@@ -207,10 +207,12 @@ class OutlookMailClient(MailClient):
         # ProxyHandler({}) explicitly disables system proxy so urllib doesn't
         # pick up the Windows registry proxy (e.g. Clash's auto-set system proxy)
         # which would break TLS for port 443.
+        direct_exc_repr = ""
         try:
             no_proxy_opener = _urlreq.build_opener(_urlreq.ProxyHandler({}))
             return _fetch(no_proxy_opener)
         except Exception as direct_exc:
+            direct_exc_repr = repr(direct_exc)
             logger.debug(
                 f"[Outlook] Direct token fetch failed ({type(direct_exc).__name__}: "
                 f"{direct_exc!r}), retrying via proxy…"
@@ -227,7 +229,7 @@ class OutlookMailClient(MailClient):
 
         raise RuntimeError(
             f"[Outlook] Token refresh failed for {self._email} "
-            f"(direct error: {direct_exc!r}; no proxy configured)"
+            f"(direct error: {direct_exc_repr}; no proxy configured)"
         )
 
     async def _get_token(self) -> str:
@@ -259,6 +261,11 @@ class OutlookMailClient(MailClient):
         domain: Optional[str] = None,
     ) -> str:
         """Return the Outlook address directly (no alias support needed)."""
+        if prefix or domain:
+            logger.info(
+                "[Outlook] Registration prefix/domain is ignored in fixed-address mode; "
+                f"using {self._email}"
+            )
         logger.info(f"[Outlook] Using account: {self._email}")
         return self._email
 

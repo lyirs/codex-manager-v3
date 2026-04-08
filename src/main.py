@@ -330,9 +330,10 @@ async def _register_async(
         slow_mo = 80  # default human-pacing in headed mode
 
     # Merge resolved settings into cfg for register_one
-    cfg["engine"]   = engine
+    cfg["engine"] = engine
     cfg["headless"] = headless
-    cfg["slow_mo"]  = slow_mo
+    cfg["slow_mo"] = slow_mo
+    cfg["mail_provider"] = provider
 
     # Strip optional ':index' suffix (e.g. "imap:0" → "imap") for config-dict lookup.
     provider_base = provider.split(":")[0]
@@ -404,7 +405,7 @@ async def _register_async(
                 success = result.get("status") == "注册完成"
                 await proxy_pool_mod.report_result(proxy, success)
 
-            status_icon = "✅" if result.get("status") == "注册完成" else "❌"
+            status_icon = "[OK]" if result.get("status") == "注册完成" else "[FAIL]"
             console.print(
                 f"  {status_icon} [bold]{result.get('email', 'N/A')}[/bold]"
                 f"  status={result.get('status')}"

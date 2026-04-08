@@ -10,17 +10,31 @@ ChatGPT 账号无头浏览器自动批量注册工具。
 
 ---
 
-## 更新
+## 更新 2026/04/08
 
-对比原版修复了：
+> [!WARNING]
+> **当前情况**
+>
+> - **前缀邮箱方案基本失效**：改前缀通常不会再被视为新邮箱
+> - **临时邮箱成功率较低**：大部分会卡在“不支持的域名”或“需要手机号验证”
+> - **更建议使用自建邮箱或稳定的 IMAP 邮箱**
 
-- CPA/CLIProxyAPI 连接：原版访问 localhost 类管理接口会吃系统代理，导致明明服务正常却测试失败
-- IMAP 收码：原版 Gmail/代理 IMAP 不稳定，且“邮件很快到达”时第一次轮询会把验证码当旧邮件漏掉
-- 浏览器注册流程：原版容易被 cookie 横幅、Google One Tap、Cloudflare、不同资料页形态卡住
-- 资料页填写：原版主要只兼容老的 spinbutton/下拉框，遇到单个 Birthday 文本框、Age 输入框、新版布局时会跳过或误填；现在支持 Age 页、单生日输入框、日期文本框，并且加了保护避免把年龄写进 Full name。
-- OAuth 拿 token：原版经常走到 consent / organization / callback 了却没把 token 拿回来；现在在 oauth.py 里补了组织/工作区自动选择、只点可用按钮、回调 URL 抓 code、导航事件抢 code、更稳的无等待点击，以及更长的 OAuth 超时
-- 原版 Playwright 桌面指纹存在容易引起不一致的噪声；现在在 engine.py 收紧了桌面指纹策略，减少无意义的随机变化。
-- 把 OAuth 默认超时提到 90s
+本次修复：
+
+- 修复一种新的生日页结构，支持 `MM / DD / YYYY` 分段输入控件，避免资料页卡住
+
+
+## 更新 2026/04/07
+
+重点修复：
+
+- CPA / CLIProxyAPI 连接：修复访问 `localhost` 类管理接口时误走系统代理的问题，避免服务正常却测试失败
+- IMAP 收码：修复 Gmail / 代理 IMAP 在“邮件很快到达”时首轮轮询误判旧邮件的问题
+- 浏览器注册流程：增强对 cookie 横幅、Google One Tap、Cloudflare 和不同资料页结构的兼容性
+- 资料页填写：补齐 `Age` 页、单个 `Birthday` 输入框、日期文本框等新版形态，并避免把年龄误写进 `Full name`
+- OAuth 拿 token：补齐 `consent / organization / callback` 多分支处理，支持自动选组织、抓回调 `code`、更稳的无等待点击，以及更长的 OAuth 超时
+- Playwright 桌面指纹：收紧随机噪声，减少不必要的指纹漂移
+- OAuth 默认超时：提升到 `90s`
 
 ## 功能特性
 

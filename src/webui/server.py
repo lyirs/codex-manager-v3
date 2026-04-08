@@ -89,6 +89,7 @@ async def _run_job(job: _Job) -> None:
     try:
         cfg = await settings_db.build_config()
         cfg["engine"] = job.engine
+        cfg["mail_provider"] = job.provider
 
         strategy     = cfg.get("proxy_strategy", "none")
         static_proxy = cfg.get("proxy_static") or None

@@ -4,10 +4,12 @@
 *.py[cod]
 
 # Local runtime data
-accounts.db
-register.log
-webui_stdout.log
-webui_stderr.log
+accounts.db*
+register.log*
+webui_stdout.log*
+webui_stderr.log*
+output/
+playwright-report/
 
 # Frontend build output
 src/webui/static/

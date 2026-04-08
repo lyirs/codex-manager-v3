@@ -214,6 +214,20 @@ def _random_alias(length: int = 8) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
+def _alias_suffix_from_prefix(prefix: Optional[str]) -> str:
+    """
+    Turn an optional registration prefix into a safe alias suffix.
+
+    IMAP alias mode must keep the base mailbox local-part intact, so we fold the
+    user-supplied prefix into the ``+alias`` suffix instead of trying to replace
+    the mailbox address itself.
+    """
+    cleaned = re.sub(r"[^a-z0-9]+", "", (prefix or "").lower())[:12]
+    if not cleaned:
+        return _random_alias()
+    return f"{cleaned}{_random_alias(4)}"
+
+
 def _make_xoauth2_token(email: str, access_token: str) -> str:
     """Build the base64-encoded XOAUTH2 SASL token for IMAP authentication."""
     raw = f"user={email}\x01auth=Bearer {access_token}\x01\x01"
@@ -300,10 +314,24 @@ class IMAPMailClient(MailClient):
             local, _, dom = self._email.partition("@")
             # Strip any pre-existing alias suffix before adding a new one.
             local = local.split("+")[0]
-            alias_email = f"{local}+{_random_alias()}@{dom}"
-            logger.info(f"[IMAP] Alias mode — using {alias_email} (inbox: {self._email})")
+            alias_suffix = _alias_suffix_from_prefix(prefix)
+            alias_email = f"{local}+{alias_suffix}@{dom}"
+            if domain and domain.lower() != dom.lower():
+                logger.info(
+                    f"[IMAP] Alias mode ignores custom domain={domain!r}; "
+                    f"using inbox domain {dom!r}"
+                )
+            logger.info(
+                f"[IMAP] Alias mode — using {alias_email} (inbox: {self._email}, "
+                f"prefix_applied={'yes' if prefix else 'no'})"
+            )
             return alias_email
 
+        if prefix or domain:
+            logger.info(
+                "[IMAP] Fixed mailbox mode ignores registration prefix/domain; "
+                f"using configured address {self._email}"
+            )
         logger.info(f"[IMAP] Using fixed mailbox: {self._email}")
         return self._email
 

@@ -27,6 +27,48 @@ def _extract_code(text: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _coerce_records(payload) -> list[dict]:
+    """
+    GPTMail has changed response shapes over time.
+
+    Normalize the common variants into a flat list of dict records:
+      - {"data": {"emails": [...]}}
+      - {"data": [...]}
+      - {"emails": [...]}
+      - [...]
+      - {"id": ..., ...}
+    """
+    if payload is None:
+        return []
+
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+
+    if not isinstance(payload, dict):
+        return []
+
+    if "data" in payload:
+        return _coerce_records(payload.get("data"))
+
+    if "emails" in payload:
+        return _coerce_records(payload.get("emails"))
+
+    if any(k in payload for k in ("id", "subject", "content", "html_content")):
+        return [payload]
+
+    return []
+
+
+def _combined_mail_text(mail: dict) -> str:
+    return " ".join(filter(None, [
+        str(mail.get("subject", "")),
+        str(mail.get("content", "")),
+        str(mail.get("html_content", "")),
+        str(mail.get("text_content", "")),
+        str(mail.get("body", "")),
+    ]))
+
+
 class GPTMailClient(MailClient):
     def __init__(self, api_key: str = "gpt-test", base_url: str = BASE_URL) -> None:
         self._api_key = api_key
@@ -91,15 +133,7 @@ class GPTMailClient(MailClient):
                     )
                     r.raise_for_status()
                     payload = r.json()
-
-                    raw_emails = (
-                        (payload.get("data") or {}).get("emails")
-                        or payload.get("data")
-                        or payload.get("emails")
-                        or []
-                    )
-                    if isinstance(raw_emails, dict):
-                        raw_emails = list(raw_emails.values())
+                    raw_emails = _coerce_records(payload)
 
                     for mail in raw_emails:
                         mid = str(mail.get("id", ""))
@@ -107,11 +141,7 @@ class GPTMailClient(MailClient):
                             continue
                         seen_ids.add(mid)
 
-                        combined = " ".join(filter(None, [
-                            mail.get("subject", ""),
-                            mail.get("content", ""),
-                            mail.get("html_content", ""),
-                        ]))
+                        combined = _combined_mail_text(mail)
                         code = _extract_code(combined)
 
                         if not code and mid:
@@ -121,12 +151,9 @@ class GPTMailClient(MailClient):
                                     headers=self._headers,
                                 )
                                 det.raise_for_status()
-                                det_data = det.json().get("data") or {}
-                                combined2 = " ".join(filter(None, [
-                                    det_data.get("subject", ""),
-                                    det_data.get("content", ""),
-                                    det_data.get("html_content", ""),
-                                ]))
+                                detail_records = _coerce_records(det.json())
+                                det_data = detail_records[0] if detail_records else {}
+                                combined2 = _combined_mail_text(det_data)
                                 code = _extract_code(combined2)
                             except Exception:
                                 pass
