@@ -397,6 +397,7 @@ async def register_one(
         "firstName": first_name,
         "lastName":  last_name,
         "birthday":  birthday,
+        "loginMode": "password",
         "status":    "starting",
         "provider":  cfg.get("mail_provider", "gptmail"),
         "proxy":     proxy or "",
@@ -427,7 +428,7 @@ async def register_one(
                         token = await acquire_tokens_via_browser(
                             page=page,
                             email=email,
-                            password=password,
+                            password=account.get("password", ""),
                             first_name=first_name,
                             last_name=last_name,
                             birthday=birthday,
@@ -665,11 +666,19 @@ async def _state_machine(
     elif detected == "otp":
         # Auth0 skipped the password step and went straight to OTP verification.
         # This is a valid registration path — continue to WAIT_CODE directly.
+        account["password"] = ""
+        account["loginMode"] = "email_otp"
         _step(4, "Auth0 直接跳转到 OTP 验证（无密码步骤），继续填写验证码")
         logger.info(
             f"[{task_id}] OTP page detected immediately after email "
             "(no password step) — jumping to WAIT_CODE"
         )
+        logger.warning(
+            f"[{task_id}] Signup skipped password creation; "
+            "saving account as email-OTP login"
+        )
+        if log_fn:
+            log_fn("⚠️ 本次注册跳过了密码设置，该账号需通过邮箱验证码登录或后续自行设置密码")
         # otp_already_visible = True  → skip _wait_for_otp_inputs below
         skip_pw_to_otp = True
     elif detected == "none":
