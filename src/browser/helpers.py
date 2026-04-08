@@ -120,6 +120,255 @@ _BIRTHDAY_INPUT_SELECTORS = [
     "xpath=//label[contains(translate(normalize-space(.), 'BIRTHDAY', 'birthday'),'birthday')]/following::input[1]",
     "xpath=//*[self::label or self::div or self::span or self::p][contains(translate(normalize-space(.), 'BIRTHDAY', 'birthday'),'birthday')]/following::input[1]",
 ]
+_BIRTHDAY_SEGMENT_SELECTOR = "[role='spinbutton'], [contenteditable='true'][inputmode='numeric']"
+
+
+def _birthday_segment_field(info: dict, index: int) -> str:
+    """
+    Classify a segmented birthday control as month/day/year.
+
+    Auth0's birthday widget can expose semantic aria-labels ("month, ") but can
+    also degrade into generic contenteditable segments where only placeholder-ish
+    text such as ``mm`` / ``dd`` / ``yyyy`` remains visible.
+    """
+    label = str(info.get("label", "") or "").lower()
+    text = str(info.get("text", "") or "").lower()
+    placeholder = str(info.get("placeholder", "") or "").lower()
+
+    try:
+        mx = int(info.get("max") or 0)
+    except Exception:
+        mx = 0
+
+    if "year" in label or "yyyy" in text or "yyyy" in placeholder or mx > 200:
+        return "year"
+    if "month" in label or text in {"m", "mm"} or "month" in placeholder or (0 < mx <= 12):
+        return "month"
+    if "day" in label or text in {"d", "dd"} or "day" in placeholder or (12 < mx <= 31):
+        return "day"
+    return ["month", "day", "year"][min(index, 2)]
+
+
+def _birthday_segment_order(infos: list[dict]) -> list[str]:
+    fields = [_birthday_segment_field(info, i) for i, info in enumerate(infos[:3])]
+    return fields if set(fields) == {"month", "day", "year"} else ["month", "day", "year"]
+
+
+async def _clear_birthday_segment_markers(page: Page) -> None:
+    try:
+        await page.evaluate(
+            """
+            () => {
+                for (const el of document.querySelectorAll('[data-codex-birthday-segment]')) {
+                    el.removeAttribute('data-codex-birthday-segment');
+                }
+            }
+            """
+        )
+    except Exception:
+        pass
+
+
+async def _locate_birthday_segments(
+    page: Page,
+    *,
+    timeout_ms: int = 1_500,
+) -> list[dict]:
+    """
+    Locate segmented birthday widgets.
+
+    Supports both:
+      - ``div[role='spinbutton']`` segments
+      - fallback ``contenteditable`` numeric segments used by the same UI
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_ms / 1000
+
+    while loop.time() < deadline:
+        marker = f"codex-bday-seg-{random.randint(100000, 999999)}"
+        try:
+            infos = await page.evaluate(
+                """
+                ([marker]) => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect();
+                        const s = window.getComputedStyle(el);
+                        return r.width > 0 && r.height > 0 &&
+                            s.display !== 'none' && s.visibility !== 'hidden';
+                    };
+                    const clean = (text) => (text || '').replace(/\\s+/g, ' ').trim();
+                    const around = (el) => {
+                        const parts = [];
+                        let node = el;
+                        for (let depth = 0; node && depth < 4; depth += 1, node = node.parentElement) {
+                            const text = clean(node.textContent);
+                            if (text) parts.push(text.slice(0, 200));
+                        }
+                        return clean(parts.join(' | '));
+                    };
+
+                    for (const el of document.querySelectorAll('[data-codex-birthday-segment]')) {
+                        el.removeAttribute('data-codex-birthday-segment');
+                    }
+
+                    const raw = Array.from(document.querySelectorAll(
+                        "[role='spinbutton'], [contenteditable='true'][inputmode='numeric']"
+                    )).filter(visible);
+
+                    const scored = raw.map((el, index) => {
+                        const label = clean(el.getAttribute('aria-label') || '');
+                        const placeholder = clean(el.getAttribute('placeholder') || '');
+                        const text = clean(el.textContent || '');
+                        const context = around(el);
+                        const combined = `${label} ${placeholder} ${text} ${context}`.toLowerCase();
+                        let score = 0;
+                        if ((el.getAttribute('role') || '').toLowerCase() === 'spinbutton') score += 5;
+                        if ((el.getAttribute('contenteditable') || '').toLowerCase() === 'true') score += 2;
+                        if (/(month|day|year)/i.test(label)) score += 6;
+                        if (/(birthday|birth\\s*date|birthdate|date\\s*of\\s*birth|\\bdob\\b)/i.test(combined)) score += 4;
+                        if (/(\\bmm\\b|\\bdd\\b|yyyy|\\d{2}\\/\\d{2}\\/\\d{4})/i.test(combined)) score += 2;
+                        return {el, index, score, label, placeholder, text, context};
+                    }).filter((item) => item.score > 0 || raw.length === 3);
+
+                    if (scored.length < 3) return [];
+
+                    const picked = scored
+                        .sort((a, b) => a.index - b.index)
+                        .slice(0, 3)
+                        .map((item, i) => {
+                            item.el.setAttribute('data-codex-birthday-segment', `${marker}-${i}`);
+                            const maxRaw = item.el.getAttribute('aria-valuemax') || '';
+                            const max = Number.parseInt(maxRaw, 10);
+                            return {
+                                selector: `[data-codex-birthday-segment="${marker}-${i}"]`,
+                                role: item.el.getAttribute('role') || '',
+                                label: item.label,
+                                placeholder: item.placeholder,
+                                text: item.text,
+                                max: Number.isFinite(max) ? max : 0,
+                            };
+                        });
+
+                    return picked;
+                }
+                """,
+                [marker],
+            )
+        except Exception:
+            infos = []
+
+        if infos and len(infos) >= 3:
+            return infos[:3]
+        await asyncio.sleep(0.25)
+
+    await _clear_birthday_segment_markers(page)
+    return []
+
+
+async def _set_editable_numeric_segment(
+    locator: Locator,
+    *,
+    target: int,
+    pad_width: int,
+) -> bool:
+    value = str(target).zfill(pad_width)
+
+    try:
+        await locator.focus()
+        await locator.click()
+        await locator.press("Control+a")
+        await locator.press("Delete")
+        await locator.press_sequentially(value, delay=40)
+    except Exception:
+        pass
+
+    await asyncio.sleep(0.15)
+    try:
+        text = await locator.evaluate(
+            "el => (el.textContent || el.getAttribute('aria-valuenow') || '').trim()"
+        )
+    except Exception:
+        text = ""
+    if "".join(ch for ch in text if ch.isdigit()) == value:
+        return True
+
+    try:
+        await locator.evaluate(
+            """
+            (el, value) => {
+                el.focus();
+                if (el.isContentEditable) {
+                    el.textContent = value;
+                } else if ('value' in el) {
+                    el.value = value;
+                }
+                if (el.getAttribute('aria-valuenow') !== null) {
+                    el.setAttribute('aria-valuenow', String(parseInt(value, 10)));
+                }
+                el.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    composed: true,
+                    data: value,
+                    inputType: 'insertText',
+                }));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('blur', {bubbles: true}));
+            }
+            """,
+            value,
+        )
+    except Exception:
+        return False
+
+    await asyncio.sleep(0.15)
+    try:
+        text = await locator.evaluate(
+            "el => (el.textContent || el.getAttribute('aria-valuenow') || '').trim()"
+        )
+    except Exception:
+        text = ""
+    return "".join(ch for ch in text if ch.isdigit()) == value
+
+
+async def fill_birthday_segments(
+    page: Page,
+    *,
+    year: int,
+    month: int,
+    day: int,
+    timeout_ms: int = 3_000,
+) -> Optional[str]:
+    """
+    Fill segmented birthday widgets such as ``MM / DD / YYYY`` controls.
+
+    Returns a short description on success, or None when no supported segmented
+    birthday widget is present.
+    """
+    infos = await _locate_birthday_segments(page, timeout_ms=timeout_ms)
+    if len(infos) < 3:
+        return None
+
+    order = _birthday_segment_order(infos)
+    values = {"month": month, "day": day, "year": year}
+
+    try:
+        for info, field in zip(infos[:3], order):
+            loc = page.locator(info["selector"]).first
+            if str(info.get("role", "") or "").lower() == "spinbutton":
+                await set_spinbutton(page, loc, values[field])
+            else:
+                ok = await _set_editable_numeric_segment(
+                    loc,
+                    target=values[field],
+                    pad_width=4 if field == "year" else 2,
+                )
+                if not ok:
+                    return None
+    finally:
+        await _clear_birthday_segment_markers(page)
+
+    return f"segmented controls order={order}"
 
 
 async def has_visible_birthday_controls(
@@ -133,9 +382,13 @@ async def has_visible_birthday_controls(
     This is intentionally conservative: if visible spinbuttons or birthday/date
     inputs already exist, callers should avoid trying the age-only fallback.
     """
+    segments = await _locate_birthday_segments(page, timeout_ms=min(timeout_ms, 1_500))
+    if segments:
+        await _clear_birthday_segment_markers(page)
+        return True
     result = await wait_any_element(
         page,
-        ["[role='spinbutton']", *_BIRTHDAY_INPUT_SELECTORS],
+        _BIRTHDAY_INPUT_SELECTORS,
         timeout_ms=timeout_ms,
     )
     return result is not None

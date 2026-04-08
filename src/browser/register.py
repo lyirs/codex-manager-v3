@@ -39,6 +39,7 @@ from src.browser.helpers import (
     dismiss_known_obstructions,
     fill_age_input,
     fill_birthday_input,
+    fill_birthday_segments,
     find_signup_button,
     has_visible_birthday_controls,
     human_move_and_click,
@@ -47,7 +48,6 @@ from src.browser.helpers import (
     is_visible,
     jitter_sleep,
     set_react_input,
-    set_spinbutton,
     wait_any_element,
 )
 from src.mail.base import MailClient
@@ -168,6 +168,42 @@ def _gen_prefix(length: int = 12) -> str:
     )
 
 
+_LOGIN_PASSWORD_URL_MARKERS = (
+    "/log-in/password",
+    "/u/login/password",
+)
+_LOGIN_PASSWORD_BODY_MARKERS = (
+    "welcome back",
+    "enter your password",
+    "forgot password",
+    "try another method",
+    "use a passkey",
+    "continue with password",
+)
+_SIGNUP_PASSWORD_BODY_MARKERS = (
+    "create your password",
+    "create a password",
+    "set a password",
+    "choose a password",
+    "continue signing up",
+    "create account",
+    "sign up",
+)
+_ABOUT_YOU_VALIDATION_MARKERS = (
+    "let's confirm your age",
+    "lets confirm your age",
+    "we can't create an account with that info",
+    "we cant create an account with that info",
+    "birthday",
+)
+_ALREADY_EXISTS_ERROR_MARKERS = (
+    "user_already_exists",
+    "user already exists",
+    "already exists",
+    "an error occurred during authentication",
+)
+
+
 # ── Custom exceptions ──────────────────────────────────────────────────────
 
 class RegistrationError(Exception):
@@ -184,6 +220,91 @@ class SkipRegistrationError(FatalRegistrationError):
 
 class EmailAlreadyRegisteredError(FatalRegistrationError):
     """Raised when Auth0 redirects to /log-in/password — email already has an account."""
+
+
+def _already_registered_hint(mail_client: MailClient) -> Optional[str]:
+    cls_name = type(mail_client).__name__
+    if cls_name == "OutlookMailClient":
+        return (
+            "当前 Outlook 模式会直接使用该账户邮箱注册，设置里的邮箱前缀/域名不会生效；"
+            "如果这个地址已经注册过，需要切换到 `outlook` 轮换其它账号，"
+            "或改用支持生成新地址的邮箱提供器。"
+        )
+
+    if cls_name == "IMAPMailClient" and not getattr(mail_client, "_use_alias", False):
+        return (
+            "当前 IMAP 模式会直接使用固定邮箱注册，设置里的邮箱前缀/域名不会生效；"
+            "如果这个地址已经注册过，请开启别名模式或更换邮箱账号。"
+        )
+
+    if cls_name == "IMAPMailClient" and getattr(mail_client, "_use_alias", False):
+        mailbox_email = str(getattr(mail_client, "_email", "")).lower()
+        if mailbox_email.endswith("@gmail.com"):
+            return (
+                "当前是 Gmail `+alias` 模式。结合你这次现象，目标站点很可能会把 "
+                "`name+alias@gmail.com` 规范化为 `name@gmail.com`，"
+                "所以不同前缀/别名仍可能被视为同一邮箱。建议改用真实不同邮箱或临时邮箱服务。"
+            )
+
+    return None
+
+
+async def _page_text_lower(page: Page) -> str:
+    try:
+        return await page.evaluate("() => (document.body?.innerText || '').toLowerCase()")
+    except Exception:
+        return ""
+
+
+def _is_about_you_url(url: str) -> bool:
+    url = url.lower()
+    return "about-you" in url or "about_you" in url
+
+
+async def _profile_validation_markers(page: Page) -> list[str]:
+    body_text = await _page_text_lower(page)
+    return [marker for marker in _ABOUT_YOU_VALIDATION_MARKERS if marker in body_text]
+
+
+async def _already_exists_error_markers(page: Page) -> list[str]:
+    body_text = await _page_text_lower(page)
+    return [marker for marker in _ALREADY_EXISTS_ERROR_MARKERS if marker in body_text]
+
+
+async def _looks_like_existing_account_password_page(task_id: str, page: Page) -> bool:
+    """
+    Auth0 occasionally reuses password-like routes while the signup UI is still
+    settling. Only classify the page as "already registered" when the login
+    password page is confirmed by page copy; otherwise keep waiting so we don't
+    mislabel a fresh signup as an existing account.
+    """
+    url = page.url.lower()
+    if not any(marker in url for marker in _LOGIN_PASSWORD_URL_MARKERS):
+        return False
+
+    body_text = await _page_text_lower(page)
+
+    signup_hits = [marker for marker in _SIGNUP_PASSWORD_BODY_MARKERS if marker in body_text]
+    if signup_hits:
+        logger.info(
+            f"[{task_id}] Login-looking password URL but signup copy detected; "
+            f"treating as signup flow. hits={signup_hits!r} url={page.url}"
+        )
+        return False
+
+    login_hits = [marker for marker in _LOGIN_PASSWORD_BODY_MARKERS if marker in body_text]
+    if login_hits:
+        logger.info(
+            f"[{task_id}] Existing-account login password page confirmed. "
+            f"hits={login_hits!r} url={page.url}"
+        )
+        return True
+
+    logger.debug(
+        f"[{task_id}] Ambiguous password URL without login/signup markers yet; "
+        f"waiting for page to settle. url={page.url}"
+    )
+    return False
 
 
 # ── Network-safe navigation ────────────────────────────────────────────────
@@ -346,7 +467,13 @@ async def register_one(
                 if log_fn:
                     log_fn(f"⚠️ 跳过：该邮箱已注册 ({account['email']})")
                 account["status"] = "already_registered"
-                account["error"] = str(exc)
+                hint = _already_registered_hint(mail_client)
+                if hint:
+                    logger.info(f"[{task_id}] {hint}")
+                    if log_fn:
+                        log_fn(hint)
+                    account["hint"] = hint
+                account["error"] = f"{exc}；{hint}" if hint else str(exc)
                 return account
 
             # except SkipRegistrationError as exc:
@@ -770,6 +897,11 @@ async def _state_machine(
     final_url = page.url
     logger.info(f"[{task_id}] Final URL={final_url}")
 
+    if _is_about_you_url(final_url):
+        raise RegistrationError(
+            f"Registration is still stuck on the about-you page after submit. URL={final_url}"
+        )
+
     if AUTH0_HOST in final_url or "/auth/" in final_url:
         logger.warning(
             f"[{task_id}] Still on auth page after completion: {final_url}"
@@ -799,12 +931,11 @@ async def _wait_for_password_or_otp(task_id: str, page: Page, timeout_ms: int = 
     while asyncio.get_event_loop().time() < deadline:
         url = page.url.lower()
 
-        # ── Detect already-registered: Auth0 login flow URL ──────────
-        # When email is already registered, Auth0 redirects to the *login*
-        # password page (/log-in/password) instead of the *signup* flow.
-        # This must be checked BEFORE the password-selector check because
-        # the login page also contains a password <input>.
-        if "/log-in/password" in url:
+        # ── Detect already-registered: confirmed Auth0 login password page ──
+        # A bare URL match is no longer reliable enough on its own because the
+        # provider can briefly visit login-like paths during signup. Confirm
+        # with page copy before classifying the email as an existing account.
+        if await _looks_like_existing_account_password_page(task_id, page):
             return "already_registered"
 
         # Check for password input first
@@ -858,6 +989,12 @@ async def _assert_not_error(task_id: str, page: Page) -> None:
       • body text contains '糟糕', '出错了', 'Operation timed out', '操作超时'
     """
     await _wait_for_cloudflare_clearance(task_id, page)
+    already_exists_markers = await _already_exists_error_markers(page)
+    if already_exists_markers:
+        raise EmailAlreadyRegisteredError(
+            "Auth error page reported an existing account: "
+            f"{already_exists_markers!r} at {page.url}"
+        )
     if "/api/auth/error" in page.url:
         raise RegistrationError(
             f"NextAuth error page — bot-detected or OAuth config issue: {page.url}"
@@ -1277,6 +1414,7 @@ async def _fill_profile(task_id: str, page: Page, account: dict, timeouts: dict)
 
     # Some newer about-you variants ask only for integer age, not full birthday.
     age_fill = None
+    birthday_fill = None
     birthday_controls_present = await has_visible_birthday_controls(
         page,
         timeout_ms=max(800, min(_pf_ms, 1_500)),
@@ -1293,49 +1431,23 @@ async def _fill_profile(task_id: str, page: Page, account: dict, timeouts: dict)
             logger.info(f"[{task_id}] Age filled via input {age_fill}")
             await asyncio.sleep(0.4)
 
-    # ── Step 2: Fill birthday spinbuttons (label-aware, mirrors oauth.py) ─────
+    # ── Step 2: Fill birthday controls ───────────────────────────────────────
     try:
-        sb_info = await page.evaluate("""
-            () => {
-                const sbs = Array.from(document.querySelectorAll('[role="spinbutton"]'));
-                return sbs.map((el, i) => ({
-                    idx:   i,
-                    label: (el.getAttribute('aria-label') || '').toLowerCase(),
-                    max:   parseInt(el.getAttribute('aria-valuemax') || '0', 10),
-                    now:   parseInt(el.getAttribute('aria-valuenow') || el.innerText || '0', 10),
-                }));
-            }
-        """)
-        logger.debug(f"[{task_id}] Profile spinbutton info: {sb_info}")
-
-        if sb_info and len(sb_info) >= 3:
-            def _detect_sb(info: dict) -> str:
-                label = info.get("label", "")
-                mx    = info.get("max", 0)
-                if "year"  in label or mx > 200:         return "year"
-                if "month" in label or (0 < mx <= 12):  return "month"
-                if "day"   in label or (12 < mx <= 31): return "day"
-                return "unknown"
-
-            field_order = [_detect_sb(sb) for sb in sb_info[:3]]
-            if set(field_order) != {"year", "month", "day"}:
-                # Default observed order on Auth0 /about-you: month → day → year
-                field_order = ["month", "day", "year"]
-            logger.info(f"[{task_id}] Birthday spinbutton order: {field_order} — {bd}")
-
-            for i, field in enumerate(field_order):
-                val = bd.get(field, 1)
-                await set_spinbutton(page, page.locator("[role='spinbutton']").nth(i), val)
-                logger.debug(f"[{task_id}] Spinbutton[{i}] {field}={val} done")
-
+        birthday_fill = await fill_birthday_segments(
+            page,
+            year=bd["year"],
+            month=bd["month"],
+            day=bd["day"],
+            timeout_ms=max(2_500, _pf_ms),
+        )
+        if birthday_fill:
+            logger.info(f"[{task_id}] Birthday filled via {birthday_fill}")
         else:
-            # Fewer than 3 spinbuttons — try <select> dropdowns first, then date input
             logger.debug(
-                f"[{task_id}] Only {len(sb_info) if sb_info else 0} spinbutton(s) — "
+                f"[{task_id}] No segmented birthday controls matched — "
                 "trying <select> dropdowns then date input"
             )
 
-            # ── Try <select> dropdown birthday pickers ────────────────────────
             _month_names = [
                 "january", "february", "march", "april", "may", "june",
                 "july", "august", "september", "october", "november", "december",
@@ -1383,9 +1495,9 @@ async def _fill_profile(task_id: str, page: Page, account: dict, timeouts: dict)
             """, [bd["month"], bd["day"], bd["year"], _month_names])
 
             if select_filled and select_filled > 0:
-                logger.info(f"[{task_id}] Birthday filled via {select_filled} <select> dropdown(s)")
+                birthday_fill = f"{select_filled} <select> dropdown(s)"
+                logger.info(f"[{task_id}] Birthday filled via {birthday_fill}")
             else:
-                # Fall back to a single birthday/date input (native or masked text input).
                 birthday_fill = await fill_birthday_input(
                     page,
                     year=bd["year"],
@@ -1402,7 +1514,7 @@ async def _fill_profile(task_id: str, page: Page, account: dict, timeouts: dict)
                     )
 
     except Exception as _e:
-        logger.warning(f"[{task_id}] Spinbutton fill error: {_e}")
+        logger.warning(f"[{task_id}] Birthday control fill error: {_e}")
 
     await asyncio.sleep(0.5)
 
@@ -1415,6 +1527,56 @@ async def _fill_profile(task_id: str, page: Page, account: dict, timeouts: dict)
 
     await asyncio.sleep(2.0)
     logger.debug(f"[{task_id}] After profile submit, URL={page.url}")
+
+    retry_markers = await _profile_validation_markers(page)
+    if _is_about_you_url(page.url) and retry_markers:
+        logger.warning(
+            f"[{task_id}] About-you page still shows validation markers after submit: "
+            f"{retry_markers!r} — retrying birthday/age fill"
+        )
+
+        await asyncio.sleep(1.0)
+        retry_age_fill = await fill_age_input(
+            page,
+            age=age,
+            timeout_ms=max(4_000, _pf_ms * 2),
+        )
+        if retry_age_fill and not age_fill:
+            age_fill = retry_age_fill
+            logger.info(f"[{task_id}] Age filled on retry via input {retry_age_fill}")
+
+        retry_birthday_fill = await fill_birthday_segments(
+            page,
+            year=bd["year"],
+            month=bd["month"],
+            day=bd["day"],
+            timeout_ms=max(5_000, _pf_ms * 2),
+        )
+        if not retry_birthday_fill:
+            retry_birthday_fill = await fill_birthday_input(
+                page,
+                year=bd["year"],
+                month=bd["month"],
+                day=bd["day"],
+                timeout_ms=max(5_000, _pf_ms * 2),
+            )
+        if retry_birthday_fill and not birthday_fill:
+            birthday_fill = retry_birthday_fill
+            logger.info(f"[{task_id}] Birthday filled on retry via {retry_birthday_fill}")
+
+        if retry_age_fill or retry_birthday_fill:
+            resubmitted = await click_submit_or_text(
+                page, ["Continue", "Agree", "同意", "Next", "Finish", "Done", "继续"]
+            )
+            if resubmitted:
+                await asyncio.sleep(2.0)
+                logger.debug(f"[{task_id}] After profile resubmit, URL={page.url}")
+
+    final_profile_markers = await _profile_validation_markers(page)
+    if _is_about_you_url(page.url) and final_profile_markers and not (age_fill or birthday_fill):
+        raise RegistrationError(
+            f"Profile page still requires birthday/age input. markers={final_profile_markers!r}"
+        )
 
 
 # ── CLI dry-run ────────────────────────────────────────────────────────────
