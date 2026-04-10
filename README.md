@@ -14,8 +14,8 @@ ChatGPT 账号无头浏览器自动批量注册工具。
 > [!WARNING]
 > **当前情况**
 >
-> - **free额度大砍
-> - **outlook/hotmail失败率暴增
+> - **free额度大砍**
+> - **outlook/hotmail失败率暴增**
 
 
 ## 更新 2026/04/08
